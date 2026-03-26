@@ -44,8 +44,8 @@ BASE_URL           = f"https://eapi.stalcraft.net/{REGION}"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")               # токен от @BotFather
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")               # твой chat_id (алерты сюда)
 
-DEFAULT_DISCOUNT_PCT   = 10
-DEFAULT_MIN_PRICE_DIFF = 5_000
+DEFAULT_DISCOUNT_PCT   = 12
+DEFAULT_MIN_PRICE_DIFF = 100_000
 DEFAULT_MIN_SALES      = 3
 
 POLL_INTERVAL  = 90
