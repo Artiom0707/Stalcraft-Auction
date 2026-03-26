@@ -1,0 +1,25 @@
+# Виртуальное окружение
+venv/
+.venv/
+
+# Секреты
+.env
+
+# Кэш
+__pycache__/
+*.pyc
+
+# Логи
+*.log
+
+# Базы данных
+*.db
+
+# Временные файлы
+artefact_cache.json
+items_cache.json
+stalcraft_db.json
+
+# IDE
+.vscode/
+.idea/
