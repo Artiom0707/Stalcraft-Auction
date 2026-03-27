@@ -11,7 +11,7 @@ pip install requests matplotlib pillow
 
 import sys, io, json, time, zipfile, logging, threading, argparse
 from datetime import datetime, timezone, timedelta
-from statistics import mean
+from statistics import mean, median, stdev
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -229,13 +229,15 @@ class DB:
                   and s["qlt"] == qlt
                   and s.get("ptn_grp", ptn_group(s.get("ptn"))) == pg]
         if not ps: return None
-        return mean(ps[-30:]), len(ps)
+        recent = ps[-30:]
+        return median(recent), len(recent)
 
     def avg_price_custom(self, item_id: str) -> Optional[tuple]:
         with self._lock:
             ps = [s["unit_price"] for s in self.sales if s["item_id"] == item_id]
         if not ps: return None
-        return mean(ps[-30:]), len(ps)
+        recent = ps[-30:]
+        return median(recent), len(recent)
 
     def sales_for(self, item_id: str) -> list:
         with self._lock:
@@ -413,24 +415,54 @@ def search_items(q: str) -> list:
 #  API
 # ═══════════════════════════════════════════════════════════════
 
-def api_get(path: str, params=None) -> Optional[dict]:
+# Глобальный счётчик ошибок API — для предохранителя аномалий
+_api_consecutive_errors = 0
+_api_last_success_ts    = 0.0
+
+def api_get(path: str, params=None, _retry=0) -> Optional[dict]:
+    global _api_consecutive_errors, _api_last_success_ts
     try:
         r = requests.get(f"{BASE_URL}{path}",
             headers={"Authorization": f"Bearer {STALCRAFT_TOKEN}"},
-            params=params or {}, timeout=15)
+            params=params or {},
+            timeout=20,          # чуть больше чем раньше
+            )
         if r.status_code == 429:
-            log.warning("Rate limit — 35 сек...")
-            time.sleep(35)
-            return api_get(path, params)
+            wait = 40 + _retry * 20
+            log.warning(f"Rate limit — ждём {wait} сек...")
+            time.sleep(wait)
+            return api_get(path, params, _retry + 1)
+        if r.status_code in (502, 503, 504):
+            # Сервер временно недоступен — ждём, не считаем это ошибкой данных
+            log.warning(f"Сервер временно недоступен ({r.status_code}) — {path}")
+            _api_consecutive_errors += 1
+            return None
         r.raise_for_status()
+        _api_consecutive_errors = 0
+        _api_last_success_ts    = time.time()
         return r.json()
-    except requests.HTTPError as e: log.error(f"HTTP {e.response.status_code} {path}")
-    except Exception as e: log.error(f"{path}: {e}")
+    except (requests.exceptions.ConnectTimeout,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError) as e:
+        _api_consecutive_errors += 1
+        log.warning(f"Таймаут/нет соединения ({_api_consecutive_errors} подряд): {path}")
+        return None
+    except requests.HTTPError as e:
+        log.error(f"HTTP {e.response.status_code} {path}")
+    except Exception as e:
+        log.error(f"{path}: {e}")
     return None
 
-def get_lots(item_id: str) -> list:
+
+def get_lots(item_id: str) -> Optional[list]:
+    """
+    Возвращает список лотов ИЛИ None если запрос не удался.
+    None отличается от [] (нет лотов на аукционе).
+    """
     d = api_get(f"/auction/{item_id}/lots", {"additional": "true", "limit": 200})
-    return d.get("lots", []) if d else []
+    if d is None:
+        return None            # API недоступен — НЕ делать detect_buyouts
+    return d.get("lots", [])  # [] = нет лотов, это нормально
 
 def extract_qlt_ptn(lot: dict, item_id: str) -> tuple:
     add = lot.get("additional") or {}
@@ -933,67 +965,245 @@ def tg_polling_loop():
 #  ГРАФИКИ
 # ═══════════════════════════════════════════════════════════════
 
+
 def make_chart(item_id: str) -> Optional[bytes]:
+    """
+    Улучшенный scatter-график:
+    - Каждое качество = отдельный subplot (свой масштаб оси Y)
+    - Scatter с jitter по X (точки не сливаются)
+    - Размер точки = relative price within group
+    - Линия тренда (полиномиальная)
+    - Медиана как горизонталь
+    - Логарифм при разбросе >8x
+    - Без почасовых агрегатов — каждая продажа = точка
+    """
     if not MPL: return None
     sales = db.sales_for(item_id)
     if not sales: return None
 
+    try:
+        import numpy as np
+    except ImportError:
+        log.warning("numpy не установлен, графики ограничены")
+        np = None
+
+    from statistics import median as _med
+
+    # ── Palette (яркие, контрастные на тёмном фоне) ────────────────
+    PG_COLORS = {
+        "0":     "#94a3b8",   # серый-синеватый
+        "1-4":   "#4ade80",   # зелёный
+        "5-9":   "#38bdf8",   # голубой
+        "10-14": "#c084fc",   # фиолетовый
+        "15":    "#fbbf24",   # золотой
+    }
+    PG_ALPHA  = {"0":.5, "1-4":.65, "5-9":.8, "10-14":.9, "15":1.0}
+
     by_qlt: dict = {}
     for s in sales:
         by_qlt.setdefault(s["qlt"], []).append(s)
-
     active = sorted(by_qlt.keys())
     if not active: return None
 
-    n = len(active)
-    fig, axes = plt.subplots(n, 1, figsize=(12, 3.5 * n), squeeze=False)
-    fig.patch.set_facecolor("#0a0c10")
-    fig.subplots_adjust(hspace=0.5)
+    n_plots = len(active)
+    fig, axes = plt.subplots(n_plots, 1, figsize=(13, 4.5 * n_plots), squeeze=False)
+    fig.patch.set_facecolor("#0b0f1a")
+    fig.subplots_adjust(hspace=0.55)
 
     for idx, qlt in enumerate(active):
         ax = axes[idx][0]
-        ax.set_facecolor("#12161e")
-        qname, qcolor = QUALITY[qlt]
+        ax.set_facecolor("#111827")
+
+        qname, _qcolor = QUALITY[qlt]
+        # Используем яркий цвет качества только для заголовка,
+        # сами точки окрашены по группе заточки
+        QL_TITLE_COLORS = {0:"#94a3b8",1:"#4ade80",2:"#818cf8",3:"#e879f9",4:"#fb7185",5:"#fcd34d"}
+        title_color = QL_TITLE_COLORS.get(qlt, "#e5e7eb")
+
         sales_q = by_qlt[qlt]
+        all_vals = [s["unit_price"] for s in sales_q if s["unit_price"] > 0]
+        if not all_vals: continue
+
+        use_log = len(all_vals) > 2 and max(all_vals) / max(min(all_vals), 1) > 8
 
         by_pg: dict = {}
         for s in sales_q:
-            pg = s.get("ptn_grp", ptn_group(s.get("ptn")))
+            pg = s.get("ptn_grp") or ptn_group(s.get("ptn"))
             by_pg.setdefault(pg, []).append(s)
 
-        alphas = {"0":0.4,"1-4":0.55,"5-9":0.7,"10-14":0.85,"15":1.0}
+        # Временной диапазон для jitter
+        all_ts = [datetime.fromisoformat(s["sold_at"]).timestamp() for s in sales_q]
+        time_span = max(all_ts) - min(all_ts) if len(all_ts) > 1 else 3600
+        jitter_scale = max(time_span * 0.012, 300)  # минимум 5 мин
+
         for pg in PTN_GROUPS:
             if pg not in by_pg: continue
             pts = sorted(
                 [(datetime.fromisoformat(s["sold_at"]), s["unit_price"])
                  for s in by_pg[pg]], key=lambda x: x[0])
-            xs, ys = zip(*pts)
-            ax.plot(xs, ys, "o-", color=qcolor,
-                    label=PTN_LABELS[pg],
-                    linewidth=1.5, markersize=4, alpha=alphas.get(pg, 0.7))
+            xs_dt = [x for x, y in pts]
+            ys    = [y for x, y in pts]
+            color = PG_COLORS.get(pg, "#e5e7eb")
+            alpha = PG_ALPHA.get(pg, 0.7)
 
-        ax.set_title(qname, color=qcolor, fontsize=10, pad=6, loc="left")
-        ax.set_ylabel("руб./шт.", color="#4a5568", fontsize=8)
-        ax.tick_params(colors="#4a5568", labelsize=7)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m %H:%M"))
-        # Логарифмическая шкала если разброс цен > 10x
-        vals = [s["unit_price"] for s in sales_q if s["unit_price"] > 0]
-        if vals and max(vals) / min(vals) > 10:
+            # Jitter
+            if np is not None:
+                xs_num = np.array([x.timestamp() for x in xs_dt])
+                jitter  = np.random.uniform(-jitter_scale, jitter_scale, len(xs_num))
+                xs_plot = [datetime.fromtimestamp(t + j, tz=timezone.utc)
+                           for t, j in zip(xs_num, jitter)]
+            else:
+                xs_plot = xs_dt
+
+            # Размер точки — относительный внутри группы
+            ymax = max(all_vals)
+            sizes = [max(25, min(180, (y / ymax) * 160 + 20)) for y in ys]
+
+            ax.scatter(xs_plot, ys, s=sizes, c=color, alpha=alpha,
+                       label=PTN_LABELS[pg], edgecolors="#0b0f1a",
+                       linewidths=0.4, zorder=3)
+
+            # Линия тренда (если >=3 точек)
+            if len(ys) >= 3 and np is not None:
+                xs_num = np.array([x.timestamp() for x in xs_dt])
+                xs_norm = (xs_num - xs_num[0]) / 3600  # в часах
+                try:
+                    deg = min(2, len(ys) - 1)
+                    coeffs = np.polyfit(xs_norm, ys, deg)
+                    xs_line = np.linspace(xs_norm[0], xs_norm[-1], 100)
+                    ys_line = np.polyval(coeffs, xs_line)
+                    xs_line_dt = [datetime.fromtimestamp(xs_num[0] + x * 3600, tz=timezone.utc)
+                                  for x in xs_line]
+                    ax.plot(xs_line_dt, ys_line, color=color, linewidth=1.2,
+                            alpha=0.35, linestyle="--", zorder=2)
+                except Exception: pass
+
+            # Медиана — пунктирная горизонталь
+            med_val = _med(ys)
+            ax.axhline(med_val, color=color, linewidth=0.9, alpha=0.45,
+                       linestyle=":", zorder=1)
+
+        # ── Оформление subplot ─────────────────────────────────────
+        ax.set_title(qname, color=title_color, fontsize=11, pad=8,
+                     loc="left", fontweight="bold")
+        ax.set_ylabel("руб./шт.", color="#4b5563", fontsize=8)
+        ax.tick_params(colors="#4b5563", labelsize=7.5, which="both")
+
+        if use_log:
             ax.set_yscale("log")
         ax.yaxis.set_major_formatter(
-            mticker.FuncFormatter(lambda v, _: f"{int(v):,}".replace(",", " ")))
-        for sp in ax.spines.values(): sp.set_edgecolor("#1e2535")
-        ax.grid(color="#1e2535", linewidth=0.5, alpha=0.6)
-        ax.legend(facecolor="#1a2030", edgecolor="#1e2535",
-                  labelcolor="#c8d8e8", fontsize=7, loc="upper left")
-        fig.autofmt_xdate(rotation=25)
+            mticker.FuncFormatter(lambda v, _: (
+                f"{int(v/1_000_000)}M" if v >= 1_000_000
+                else f"{int(v/1_000)}K" if v >= 10_000
+                else f"{int(v):,}".replace(",", " ")
+            )))
 
+        # X-axis: дата без часов
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
+        fig.autofmt_xdate(rotation=20, ha="right")
+
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#1f2937")
+        ax.grid(color="#1f2937", linewidth=0.5, alpha=0.4, which="both")
+        ax.set_axisbelow(True)
+
+        legend = ax.legend(
+            facecolor="#0d1321", edgecolor="#1f2937", borderwidth=1,
+            labelcolor="#d1d5db", fontsize=7.5, loc="upper left",
+            markerscale=0.8, framealpha=0.92,
+            title=qname, title_fontsize=7,
+        )
+        legend.get_title().set_color(title_color)
+
+    # ── Общий заголовок ──────────────────────────────────────────
     title = art_name(item_id) if item_id in art_db else item_name(item_id)
-    fig.suptitle(title, color="#c8d8e8", fontsize=12)
+    fig.suptitle(title, color="#f1f5f9", fontsize=13, y=1.01, fontweight="bold")
+
     buf = io.BytesIO()
     fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=120, facecolor=fig.get_facecolor(),
+    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor(),
                 bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def make_chart_custom(item_id: str) -> Optional[bytes]:
+    """График для кастомного предмета (без деления по качеству)."""
+    if not MPL: return None
+    sales = db.sales_for(item_id)
+    if not sales: return None
+
+    try:
+        import numpy as np
+        HAS_NP = True
+    except ImportError:
+        HAS_NP = False
+
+    from statistics import median as _med
+
+    pts = sorted([(datetime.fromisoformat(s["sold_at"]), s["unit_price"])
+                  for s in sales], key=lambda x: x[0])
+    xs_dt = [x for x, y in pts]
+    ys    = [y for x, y in pts]
+
+    fig, ax = plt.subplots(figsize=(13, 4.5))
+    fig.patch.set_facecolor("#0b0f1a")
+    ax.set_facecolor("#111827")
+
+    color = "#38bdf8"
+    ymax  = max(ys) if ys else 1
+    sizes = [max(25, min(150, (y/ymax)*130 + 20)) for y in ys]
+
+    if HAS_NP:
+        xs_num  = np.array([x.timestamp() for x in xs_dt])
+        span    = max(xs_num.max() - xs_num.min(), 3600)
+        jitter  = np.random.uniform(-span*0.012, span*0.012, len(xs_num))
+        xs_plot = [datetime.fromtimestamp(t+j, tz=timezone.utc) for t, j in zip(xs_num, jitter)]
+    else:
+        xs_plot = xs_dt
+
+    ax.scatter(xs_plot, ys, s=sizes, c=color, alpha=0.85,
+               edgecolors="#0b0f1a", linewidths=0.4, zorder=3, label="Продажа")
+
+    if len(ys) >= 3 and HAS_NP:
+        xs_norm = (xs_num - xs_num[0]) / 3600
+        try:
+            coeffs  = np.polyfit(xs_norm, ys, min(2, len(ys)-1))
+            xs_line = np.linspace(xs_norm[0], xs_norm[-1], 100)
+            ys_line = np.polyval(coeffs, xs_line)
+            xs_l_dt = [datetime.fromtimestamp(xs_num[0]+x*3600, tz=timezone.utc) for x in xs_line]
+            ax.plot(xs_l_dt, ys_line, color=color, linewidth=1.5, alpha=0.4, linestyle="--")
+        except Exception: pass
+
+    med_val = _med(ys)
+    ax.axhline(med_val, color="#fbbf24", linewidth=1.2, alpha=0.6,
+               linestyle=":", label=f"Медиана: {_fmt(med_val)} ₽")
+
+    use_log = len(ys) > 2 and max(ys) / max(min(ys), 1) > 8
+    if use_log: ax.set_yscale("log")
+
+    ax.set_title(item_name(item_id), color="#f1f5f9", fontsize=12, pad=8, fontweight="bold")
+    ax.set_ylabel("руб./шт.", color="#4b5563", fontsize=8)
+    ax.tick_params(colors="#4b5563", labelsize=7.5)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
+    fig.autofmt_xdate(rotation=20)
+    ax.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda v, _: (
+            f"{int(v/1_000_000)}M" if v >= 1_000_000
+            else f"{int(v/1_000)}K" if v >= 10_000
+            else f"{int(v):,}".replace(",", " ")
+        )))
+    for sp in ax.spines.values(): sp.set_edgecolor("#1f2937")
+    ax.grid(color="#1f2937", linewidth=0.5, alpha=0.4)
+    ax.set_axisbelow(True)
+    ax.legend(facecolor="#0d1321", edgecolor="#1f2937", labelcolor="#d1d5db", fontsize=8)
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -1002,25 +1212,41 @@ def make_chart(item_id: str) -> Optional[bytes]:
 #  МОНИТОРИНГ
 # ═══════════════════════════════════════════════════════════════
 
+# Предохранитель аномалий: максимум допустимых выкупов за один цикл
+# (если за одну итерацию по всем предметам выкупов больше порога — пропускаем)
+MAX_BUYOUTS_PER_CYCLE = 20  # если за цикл >20 выкупов — признак аномалии
+
+_cycle_buyouts = 0  # сбрасывается в начале каждого цикла
+
+
 def process_item(item_id: str, is_art: bool):
+    global _cycle_buyouts
     lots = get_lots(item_id)
-    cur  = set()
+
+    # None = API недоступен — НЕ детектируем выкупы (ложных срабатываний не будет)
+    if lots is None:
+        log.debug(f"  API недоступен для {item_id} — пропускаем detect_buyouts")
+        return
+
+    cur = set()
     for lot in lots:
         lk = db.lot_key(lot)
         if not lk: continue
         cur.add(lk)
-        if is_art:
-            qlt, ptn = extract_qlt_ptn(lot, item_id)
-        else:
-            qlt, ptn = 0, None
+        qlt, ptn = extract_qlt_ptn(lot, item_id) if is_art else (0, None)
         db.upsert(item_id, lot, qlt, ptn)
-    db.detect_buyouts(item_id, cur)
+
+    # Предохранитель: если за цикл уже много выкупов — пропускаем
+    if _cycle_buyouts < MAX_BUYOUTS_PER_CYCLE:
+        bought = db.detect_buyouts(item_id, cur)
+        _cycle_buyouts += len(bought)
+        if _cycle_buyouts >= MAX_BUYOUTS_PER_CYCLE:
+            log.warning(f"Предохранитель: {_cycle_buyouts} выкупов за цикл — подозрительно, "
+                        f"остановка detect_buyouts до следующего цикла")
+
     for lot in lots:
-        if is_art:
-            qlt, ptn = extract_qlt_ptn(lot, item_id)
-            check_alert(item_id, lot, qlt, ptn, True)
-        else:
-            check_alert(item_id, lot, 0, None, False)
+        qlt, ptn = extract_qlt_ptn(lot, item_id) if is_art else (0, None)
+        check_alert(item_id, lot, qlt, ptn, is_art)
 
 def monitor_loop():
     log.info("=" * 58)
@@ -1029,11 +1255,17 @@ def monitor_loop():
     log.info("=" * 58)
     cycle = 0
     while True:
-        cycle += 1
+        global _cycle_buyouts
+        cycle = cycle + 1
+        _cycle_buyouts = 0   # сбрасываем счётчик предохранителя
         art_ids    = list(art_db.keys())
         custom_ids = list(db.custom_items.keys())
         total      = len(art_ids) + len(custom_ids)
         st         = db.stats()
+
+        # Предупреждение если API долго недоступен
+        if _api_consecutive_errors >= 5:
+            log.error(f"⚠ API недоступен уже {_api_consecutive_errors} запросов подряд — возможен даунтайм сервера")
         log.info(f"── #{cycle} | {total} предм. | продаж:{st['total_sales']} лотов:{st['active_lots']} ──")
 
         for i, iid in enumerate(art_ids, 1):
@@ -1052,6 +1284,7 @@ def monitor_loop():
         time.sleep(POLL_INTERVAL)
 
 # ═══════════════════════════════════════════════════════════════
+#  ВЕБ-ДАШБОРД
 #  ВЕБ-ДАШБОРД
 # ═══════════════════════════════════════════════════════════════
 
