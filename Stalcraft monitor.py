@@ -51,6 +51,8 @@ DEFAULT_MIN_SALES      = 3
 POLL_INTERVAL  = 90
 REQUEST_DELAY  = 0.7
 WEB_PORT       = 8765
+# Для WebApp в Telegram нужен HTTPS URL. Пропиши в .env или замени здесь:
+WEB_APP_URL    = os.getenv('WEB_APP_URL', f'http://127.0.0.1:8765')
 
 GITHUB_ZIP    = "https://github.com/EXBO-Studio/stalcraft-database/archive/refs/heads/main.zip"
 GITHUB_COMMIT = "https://api.github.com/repos/EXBO-Studio/stalcraft-database/commits/main"
@@ -122,6 +124,8 @@ class DB:
             "min_price_diff": DEFAULT_MIN_PRICE_DIFF,
             "min_sales":      DEFAULT_MIN_SALES,
         }
+        self.user_settings : dict = {}  # chat_id -> {discount_pct, ...}
+        self.excluded_lots : set  = set()  # lot_keys помеченные как "купил"
         self._load()
 
     def _load(self):
@@ -136,6 +140,8 @@ class DB:
             self.sent_alerts  = set(raw.get("sent_alerts", []))
             saved_s = raw.get("settings", {})
             self.settings.update({k: saved_s[k] for k in self.settings if k in saved_s})
+            self.user_settings  = raw.get("user_settings", {})
+            self.excluded_lots  = set(raw.get("excluded_lots", []))
             log.info(f"БД: {len(self.sales)} продаж, {len(self.active_lots)} лотов")
         except Exception as e:
             log.error(f"Загрузка БД: {e}")
@@ -143,13 +149,15 @@ class DB:
     def save(self):
         with self._lock:
             payload = {
-                "active_lots":  self.active_lots,
-                "sales":        self.sales[-15_000:],
-                "watch_art":    list(self.watch_art),
-                "custom_items": self.custom_items,
-                "sent_alerts":  list(self.sent_alerts)[-2000:],
-                "settings":     self.settings,
-                "saved_at":     _now(),
+                "active_lots":   self.active_lots,
+                "sales":         self.sales[-15_000:],
+                "watch_art":     list(self.watch_art),
+                "custom_items":  self.custom_items,
+                "sent_alerts":   list(self.sent_alerts)[-2000:],
+                "settings":      self.settings,
+                "user_settings": self.user_settings,
+                "excluded_lots": list(self.excluded_lots)[-5000:],
+                "saved_at":      _now(),
             }
         try:
             Path(DB_FILE).write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
@@ -163,6 +171,26 @@ class DB:
         with self._lock:
             self.settings[key] = value
         self.save()
+
+    def get_user_settings(self, chat_id: str) -> dict:
+        """Настройки конкретного пользователя (фолбэк на глобальные)."""
+        base = dict(self.settings)
+        base.update(self.user_settings.get(chat_id, {}))
+        return base
+
+    def set_user_setting(self, chat_id: str, key: str, value):
+        with self._lock:
+            self.user_settings.setdefault(chat_id, {})[key] = value
+        self.save()
+
+    def exclude_lot(self, lot_key: str):
+        """Пометить лот как 'купил' — исключить из истории цен."""
+        with self._lock:
+            self.excluded_lots.add(lot_key)
+        self.save()
+
+    def is_excluded(self, sale: dict) -> bool:
+        return sale.get("lot_key","") in self.excluded_lots
 
     def lot_key(self, lot: dict) -> str:
         raw = lot.get("id")
@@ -202,9 +230,9 @@ class DB:
                 snap = self.active_lots.pop(key)
                 if not _is_buyout(snap.get("end_time", ""), now_dt):
                     continue
-                price = snap.get("buyout") or snap.get("start") or 0
+                price = snap.get("buyout") or 0
                 amt   = max(snap.get("amount", 1) or 1, 1)
-                if price <= 0: continue
+                if price <= 0: continue  # без buyout = не считаем продажей
                 sale = {
                     "item_id":    item_id,
                     "lot_key":    snap["lot_key"],
@@ -227,17 +255,61 @@ class DB:
             ps = [s["unit_price"] for s in self.sales
                   if s["item_id"] == item_id
                   and s["qlt"] == qlt
-                  and s.get("ptn_grp", ptn_group(s.get("ptn"))) == pg]
+                  and s.get("ptn_grp", ptn_group(s.get("ptn"))) == pg
+                  and s.get("lot_key","") not in self.excluded_lots]
         if not ps: return None
-        recent = ps[-30:]
-        return median(recent), len(recent)
+        recent = ps[-40:]  # чуть больше истории
+
+        filtered = _filtered_prices(recent)
+
+        # мало нормальных данных — игнор
+        if len(filtered) < 3:
+            return None
+
+        # анти-манипуляция (резкий разброс)
+        if len(filtered) >= 5:
+            if max(filtered) > min(filtered) * 5:
+                return None
+
+        # "реальная цена" (не средняя, а ближе к покупкам)
+        base_price = _percentile(filtered, 0.3)
+
+        # сглаживание тренда
+        trend_price = _ema(filtered, 0.25)
+
+        # комбинируем
+        final_price = (base_price * 0.7 + trend_price * 0.3)
+
+        if max(filtered) > min(filtered) * 5:
+            log.warning(f"Слишком большой разброс цен для {item_id}")
+            return None
+
+        return final_price, len(filtered)
 
     def avg_price_custom(self, item_id: str) -> Optional[tuple]:
         with self._lock:
             ps = [s["unit_price"] for s in self.sales if s["item_id"] == item_id]
         if not ps: return None
-        recent = ps[-30:]
-        return median(recent), len(recent)
+        recent = ps[-40:]
+        filtered = _filtered_prices(recent)
+
+        if len(filtered) < 3:
+            return None
+
+        if len(filtered) >= 5:
+            if max(filtered) > min(filtered) * 5:
+                return None
+
+        base_price = _percentile(filtered, 0.3)
+        trend_price = _ema(filtered, 0.25)
+
+        final_price = (base_price * 0.7 + trend_price * 0.3)
+
+        if max(filtered) > min(filtered) * 5:
+            log.warning(f"Слишком большой разброс цен для {item_id}")
+            return None
+
+        return final_price, len(filtered)
 
     def sales_for(self, item_id: str) -> list:
         with self._lock:
@@ -296,6 +368,164 @@ def _is_buyout(end_str: str, now_dt: datetime) -> bool:
             return now_dt < parse(end_str) + timedelta(seconds=60)
         except Exception: pass
     return False
+def _filtered_prices(prices: list) -> list:
+    if len(prices) < 5:
+        return prices
+
+    s = sorted(prices)
+    q1 = s[len(s)//4]
+    q3 = s[len(s)*3//4]
+    iqr = q3 - q1
+
+    low  = q1 - 1.5 * iqr
+    high = q3 + 1.5 * iqr
+
+    return [p for p in prices if low <= p <= high]
+
+
+def _percentile(data: list, p: float):
+    if not data:
+        return None
+    s = sorted(data)
+    k = int(len(s) * p)
+    return s[min(k, len(s)-1)]
+
+
+def _ema(prices: list, alpha=0.3):
+    """Экспоненциальное среднее (последние значения важнее)"""
+    if not prices:
+        return None
+    ema = prices[0]
+    for p in prices[1:]:
+        ema = alpha * p + (1 - alpha) * ema
+    return ema
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MARKET ANALYSIS
+# ═══════════════════════════════════════════════════════════════
+
+def _market_analysis(prices_with_times: list) -> dict:
+    """
+    Биржевой анализ цен.
+    prices_with_times: список (timestamp, price) отсортированный по времени.
+    Возвращает dict с сигналами.
+    """
+    result = {
+        "panic_sale":  None,  # str описание или None
+        "reversal":    None,
+        "bot_pattern": None,
+        "forecast":    None,
+        "trend":       None,  # "up"/"down"/"flat"
+    }
+    if len(prices_with_times) < 4:
+        return result
+
+    times  = [t for t, p in prices_with_times]
+    prices = [p for t, p in prices_with_times]
+    n      = len(prices)
+
+    # Фильтрация выбросов перед анализом
+    filtered = _filtered_prices(prices)
+    if not filtered:
+        return result
+
+    avg_p = sum(filtered) / len(filtered)
+
+    # ── 📉 ПАНИК-СЕЙЛ ─────────────────────────────────────────
+    # Последние 3 продажи значительно ниже средней
+    if n >= 5:
+        recent3 = prices[-3:]
+        recent_avg = sum(recent3) / len(recent3)
+        if recent_avg < avg_p * 0.75:
+            drop_pct = (1 - recent_avg / avg_p) * 100
+            result["panic_sale"] = f"📉 Паник-сейл: цена упала на {drop_pct:.0f}% ниже нормы"
+        # Быстрое падение (последние 3 точки убывают)
+        elif prices[-1] < prices[-2] < prices[-3] and prices[-1] < avg_p * 0.85:
+            result["panic_sale"] = f"📉 Нарастающее давление: 3 продажи подряд вниз"
+
+    # ── 📈 РАЗВОРОТ РЫНКА ─────────────────────────────────────
+    # После длительного снижения — рост последних продаж
+    if n >= 6:
+        first_half  = prices[:n//2]
+        second_half = prices[n//2:]
+        avg_first   = sum(first_half) / len(first_half)
+        avg_second  = sum(second_half) / len(second_half)
+        if avg_second > avg_first * 1.12:
+            growth = (avg_second / avg_first - 1) * 100
+            result["reversal"] = f"📈 Разворот: цена выросла на {growth:.0f}% в последние сделки"
+        elif avg_second < avg_first * 0.88:
+            drop = (1 - avg_second / avg_first) * 100
+            result["trend"] = "down"
+
+        if result["trend"] is None:
+            if avg_second > avg_first * 1.03:
+                result["trend"] = "up"
+            elif abs(avg_second - avg_first) / avg_first < 0.03:
+                result["trend"] = "flat"
+            else:
+                result["trend"] = "down"
+
+    # ── 🤖 ДЕТЕКТ БОТОВ/МАНИПУЛЯЦИЙ ──────────────────────────
+    # Признаки: много одинаковых цен, или продажи через ровные промежутки
+    if n >= 5:
+        rounded = sum(1 for p in prices if p % 1000 == 0 or p % 500 == 0)
+        if rounded / n > 0.7:
+            result["bot_pattern"] = f"🤖 Возможна манипуляция: {rounded}/{n} продаж по круглым ценам"
+
+        # Дублирующиеся цены
+        from collections import Counter
+        price_counts = Counter(int(p) for p in prices)
+        max_dup = price_counts.most_common(1)[0][1] if price_counts else 0
+        if max_dup >= 3:
+            result["bot_pattern"] = (
+                f"🤖 Ботовая активность: одна цена повторяется {max_dup}x"
+            )
+
+    # ── 💰 ПРОГНОЗ ЦЕНЫ (линейный тренд по времени) ──────────
+    if n >= 5:
+        try:
+            t0 = times[0]
+            xs = [(t - t0) / 3600 for t in times]  # в часах
+            # Метод наименьших квадратов вручную
+            n_pts = len(xs)
+            sx  = sum(xs);    sy  = sum(prices)
+            sxy = sum(x*y for x,y in zip(xs, prices))
+            sx2 = sum(x**2 for x in xs)
+            denom = n_pts * sx2 - sx * sx
+            if abs(denom) > 1e-9:
+                slope = (n_pts * sxy - sx * sy) / denom
+                # Прогноз на +24 часа
+                x_future = xs[-1] + 24
+                forecast = (sy/n_pts) + slope * (x_future - sx/n_pts)
+                forecast = max(forecast, 0)
+                direction = "▲" if slope > 0 else "▼"
+                if abs(slope) / (avg_p / 100) > 0.5:  # значимый тренд
+                    result["forecast"] = (
+                        f"💰 Прогноз +24ч: {direction} {int(forecast):,}".replace(",", " ") + " руб."
+                    )
+        except Exception:
+            pass
+
+    return result
+
+
+def _get_price_history_timed(item_id: str, qlt: int, pg: str) -> list:
+    """Список (timestamp, price) для анализа."""
+    with db._lock:
+        sales = [s for s in db.sales
+                 if s["item_id"] == item_id
+                 and s["qlt"] == qlt
+                 and s.get("ptn_grp", ptn_group(s.get("ptn"))) == pg
+                 and not db.is_excluded(s)]
+    result = []
+    for s in sales:
+        try:
+            ts = datetime.fromisoformat(s["sold_at"].replace("Z","+00:00")).timestamp()
+            result.append((ts, s["unit_price"]))
+        except Exception:
+            pass
+    return sorted(result)
 
 
 db = DB()
@@ -432,8 +662,12 @@ def api_get(path: str, params=None, _retry=0) -> Optional[dict]:
             log.warning(f"Rate limit — ждём {wait} сек...")
             time.sleep(wait)
             return api_get(path, params, _retry + 1)
+        if r.status_code == 401:
+            log.error("❌ ТОКЕН ИСТЁК (HTTP 401) — обнови STALCRAFT_TOKEN в .env файле")
+            log.error("   detect_buyouts заблокирован до исправления токена")
+            _api_consecutive_errors += 1
+            return None   # None = не вызывать detect_buyouts
         if r.status_code in (502, 503, 504):
-            # Сервер временно недоступен — ждём, не считаем это ошибкой данных
             log.warning(f"Сервер временно недоступен ({r.status_code}) — {path}")
             _api_consecutive_errors += 1
             return None
@@ -481,12 +715,13 @@ def _fmt(v) -> str:
         return f"{int(v):,}".replace(",", "\u202f")
     return str(v)
 
-def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art) -> str:
+def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
+                 analysis: dict = None) -> str:
     circle = QUALITY_CIRCLE.get(qlt, "")
     qname  = QUALITY.get(qlt, ("?",""))[0]
     name   = art_name(item_id) if is_art else item_name(item_id)
     plabel = PTN_LABELS.get(pg, pg)
-    header = "ВЫГОДНЫЙ ЛОТ — EU" if disc >= 20 else "СКИДКА НА АУКЦИОНЕ — EU"
+    header = "🔥 ВЫГОДНЫЙ ЛОТ — EU" if disc >= 20 else "📉 СКИДКА — EU"
 
     lines = [f"<b>{header}</b>", "━━━━━━━━━━━━━━━━━━━━━"]
     if is_art:
@@ -498,17 +733,43 @@ def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art) -> str:
     else:
         lines.append(f"<b>{name}</b>")
 
-    avg_label = f"Средняя {plabel}" if is_art else "Средняя"
+    avg_label = f"Ориентир {plabel}" if is_art else "Ориентир"
     lines += [
-        f"",
+        "",
         f"💰 Цена:      <b>{_fmt(unit)}</b> руб./шт.",
         f"📊 {avg_label}: {_fmt(avg)} руб. ({n} прод.)",
         f"📉 Скидка:    <b>{disc:.1f}%</b>",
-        f"",
+    ]
+
+    # Рыночные сигналы
+    if analysis:
+        signals = []
+        if analysis.get("panic_sale"):  signals.append(analysis["panic_sale"])
+        if analysis.get("reversal"):    signals.append(analysis["reversal"])
+        if analysis.get("bot_pattern"): signals.append(analysis["bot_pattern"])
+        if analysis.get("forecast"):    signals.append(analysis["forecast"])
+        if analysis.get("trend") == "up":
+            signals.append("📈 Тренд: цена растёт")
+        elif analysis.get("trend") == "down":
+            signals.append("📉 Тренд: цена снижается")
+        if signals:
+            lines.append("")
+            lines.extend(signals)
+
+    lines += [
+        "",
         f"🕐 {datetime.now().strftime('%H:%M:%S')}",
         "━━━━━━━━━━━━━━━━━━━━━",
     ]
     return "\n".join(lines)
+
+
+def _bought_markup(item_id: str, lk: str) -> dict:
+    """Inline-кнопка 'Купил' под алертом."""
+    return {"inline_keyboard": [[
+        {"text": "✅ Купил — убрать из истории", "callback_data": f"bought:{item_id}:{lk}"}
+    ]]}
+
 
 def check_alert(item_id: str, lot: dict, qlt: int, ptn, is_art: bool = True):
     lk  = db.lot_key(lot)
@@ -516,10 +777,10 @@ def check_alert(item_id: str, lot: dict, qlt: int, ptn, is_art: bool = True):
     key = f"{item_id}:{lk}:q{qlt}:{pg}"
     if db.alert_sent(key): return
 
-    s           = db.settings
-    disc_pct    = s["discount_pct"]
-    min_diff    = s["min_price_diff"]
-    min_sales   = s["min_sales"]
+    s         = db.settings
+    disc_pct  = s["discount_pct"]
+    min_diff  = s["min_price_diff"]
+    min_sales = s["min_sales"]
 
     if is_art:
         res = db.avg_price(item_id, qlt, pg)
@@ -529,16 +790,24 @@ def check_alert(item_id: str, lot: dict, qlt: int, ptn, is_art: bool = True):
     avg, n = res
 
     amt  = max(int(lot.get("amount") or 1), 1)
-    raw  = lot.get("buyoutPrice") or lot.get("startPrice")
-    if not raw: return
+    raw  = lot.get("buyoutPrice")   # только лоты с ценой выкупа
+    if not raw: return              # без buyoutPrice — игнорируем
     unit = float(raw) / amt
 
     if not ((avg - unit) >= min_diff and unit <= avg * (1 - disc_pct / 100)):
         return
 
     disc = (1 - unit / avg) * 100
-    msg  = _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art)
-    tg_send(msg, TELEGRAM_CHAT_ID)
+
+    # Рыночный анализ
+    analysis = None
+    if is_art:
+        history = _get_price_history_timed(item_id, qlt, pg)
+        analysis = _market_analysis(history) if len(history) >= 4 else None
+
+    msg    = _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art, analysis)
+    markup = _bought_markup(item_id, lk)
+    tg_send(msg, TELEGRAM_CHAT_ID, markup)
     db.mark_sent(key)
     log.info(f"ALERT: {art_name(item_id)} q{qlt} {pg} -{disc:.1f}%")
 
@@ -546,12 +815,28 @@ def check_alert(item_id: str, lot: dict, qlt: int, ptn, is_art: bool = True):
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 
-def _tg(method: str, **kw) -> Optional[dict]:
+def _tg(method: str, _attempt: int = 0, **kw) -> Optional[dict]:
     if not TELEGRAM_TOKEN: return None
     try:
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
-                          json=kw, timeout=15)
-        return r.json() if r.ok else None
+                          json=kw, timeout=20)
+        if r.ok:
+            return r.json()
+        # Telegram rate limit
+        if r.status_code == 429:
+            retry_after = r.json().get("parameters", {}).get("retry_after", 5)
+            log.warning(f"TG rate limit, ждём {retry_after}s")
+            time.sleep(retry_after)
+            return _tg(method, _attempt, **kw)
+        log.debug(f"TG {method} → {r.status_code}: {r.text[:100]}")
+        return None
+    except (requests.exceptions.ConnectionError,
+            requests.exceptions.ReadTimeout) as e:
+        if _attempt < 2:
+            time.sleep(2 ** _attempt)  # экспоненциальная пауза: 1s, 2s
+            return _tg(method, _attempt + 1, **kw)
+        log.warning(f"TG {method} failed after retries: {type(e).__name__}")
+        return None
     except Exception as e:
         log.error(f"TG {method}: {e}")
         return None
@@ -569,13 +854,24 @@ def tg_edit(chat_id, msg_id, text, markup=None):
 def tg_answer(cid):
     _tg("answerCallbackQuery", callback_id=cid)
 
-def tg_photo(chat_id, data, caption=""):
+def tg_answer_text(cid, text):
+    _tg("answerCallbackQuery", callback_id=cid, text=text, show_alert=False)
+
+def tg_photo(chat_id, data, caption="", _attempt=0):
     if not TELEGRAM_TOKEN: return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
             data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
-            files={"photo": ("chart.png", data, "image/png")}, timeout=30)
-    except Exception as e: log.error(f"TG photo: {e}")
+            files={"photo": ("chart.png", io.BytesIO(data), "image/png")},
+            timeout=45)
+        if not r.ok:
+            log.warning(f"TG photo failed: {r.status_code}")
+    except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
+        if _attempt < 2:
+            time.sleep(2 ** _attempt)
+            tg_photo(chat_id, data, caption, _attempt + 1)
+    except Exception as e:
+        log.error(f"TG photo: {e}")
 
 def kb(*rows) -> dict:
     return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row]
@@ -589,19 +885,33 @@ def _set(chat_id, s): _user_state[chat_id] = s
 
 # ── Меню ──────────────────────────────────────────────────────
 
-def _main_kb():
-    return kb(
-        [("🔍 Артефакт",    "search_art"),
-         ("📦 Любой предмет","search_item")],
-        [("📋 Мой список",  "watchlist"),
-         ("⚙️ Настройки",  "settings")],
-        [("📊 Статус",      "status")],
+def _is_owner(chat_id: str) -> bool:
+    return str(chat_id) == str(TELEGRAM_CHAT_ID)
+
+
+def _main_kb(chat_id: str = "") -> dict:
+    web_row = (
+        [{"text": "🌐 Дашборд (WebApp)", "web_app": {"url": WEB_APP_URL}}]
+        if WEB_APP_URL.startswith("https://")
+        else [{"text": "🌐 Открыть дашборд", "url": WEB_APP_URL}]
     )
+    rows = [
+        [{"text":"🔍 Артефакт","callback_data":"search_art"},
+         {"text":"📦 Любой предмет","callback_data":"search_item"}],
+        [{"text":"📋 Мой список","callback_data":"watchlist"},
+         {"text":"📊 Статус","callback_data":"status"}],
+    ]
+    if _is_owner(chat_id):
+        rows.append([{"text":"⚙️ Настройки","callback_data":"settings"}])
+    rows.append(web_row)
+    return {"inline_keyboard": rows}
+
 
 def _send_main(chat_id, msg_id=None):
     txt = "⚗️ <b>Stalcraft Monitor EU</b>\n\nВыбери действие:"
-    if msg_id: tg_edit(chat_id, msg_id, txt, _main_kb())
-    else:       tg_send(txt, chat_id, _main_kb())
+    markup = _main_kb(chat_id)
+    if msg_id: tg_edit(chat_id, msg_id, txt, markup)
+    else:       tg_send(txt, chat_id, markup)
 
 # ── Артефакт ──────────────────────────────────────────────────
 
@@ -652,8 +962,9 @@ def _send_custom(chat_id, msg_id, item_id):
     markup = kb(
         [("🔕 Убрать" if in_wl else "🔔 Следить",
           f"{'cust_del' if in_wl else 'cust_add'}:{item_id}")],
-        [("📋 Лоты", f"lots:{item_id}"),
-         ("⬅️ Назад", "main")],
+        [("📈 График",  f"chart:{item_id}"),
+         ("📋 Лоты",    f"lots:{item_id}")],
+        [("⬅️ Назад", "main")],
     )
     txt = "\n".join(lines)
     if msg_id: tg_edit(chat_id, msg_id, txt, markup)
@@ -690,20 +1001,23 @@ def _send_lots(chat_id, msg_id, item_id):
             for pg in PTN_GROUPS:
                 pg_lots = groups[qlt].get(pg, [])
                 if not pg_lots: continue
-                sorted_pg = sorted(pg_lots, key=lambda x: x.get("buyout") or x.get("start") or 0)
+                sorted_pg = sorted([l for l in pg_lots if l.get("buyout")],
+                                   key=lambda x: x.get("buyout") or 0)
                 label = PTN_LABELS[pg]
                 lines.append(f"  {label}:")
                 for lot in sorted_pg[:MAX_PER_GROUP]:
+                    if not lot.get("buyout"): continue  # без buyoutPrice не показываем
                     amt = max(lot.get("amount", 1) or 1, 1)
-                    pr  = lot.get("buyout") or lot.get("start") or 0
+                    pr  = lot.get("buyout")
                     lines.append(f"    • {_fmt(pr // amt)} руб./шт.")
                 if len(sorted_pg) > MAX_PER_GROUP:
                     lines.append(f"    <i>+ещё {len(sorted_pg)-MAX_PER_GROUP}</i>")
     else:
-        sorted_lots = sorted(lots, key=lambda x: x.get("buyout") or x.get("start") or 0)
+        sorted_lots = [l for l in lots if l.get("buyout")]
+        sorted_lots.sort(key=lambda x: x.get("buyout") or 0)
         for lot in sorted_lots[:20]:
             amt = max(lot.get("amount", 1) or 1, 1)
-            pr  = lot.get("buyout") or lot.get("start") or 0
+            pr  = lot.get("buyout")
             lines.append(f"• {_fmt(pr // amt)} руб./шт.")
         if len(sorted_lots) > 20:
             lines.append(f"<i>+ещё {len(sorted_lots)-20}</i>")
@@ -725,8 +1039,8 @@ def _send_deals(chat_id, msg_id, item_id):
     deals = []
     for lot in lots:
         amt = max(lot.get("amount", 1) or 1, 1)
-        raw = lot.get("buyout") or lot.get("start")
-        if not raw: continue
+        raw = lot.get("buyout")
+        if not raw: continue  # только лоты с ценой выкупа
         unit = float(raw) / amt
         qlt  = lot.get("qlt", 0)
         pg   = lot.get("ptn_grp", "0")
@@ -872,20 +1186,68 @@ def _handle_text(chat_id, text):
             tg_send("❌ Неверный формат. Введи число.", chat_id,
                     kb([("⚙️ Назад","settings_fresh")]))
     else:
-        _send_main(chat_id)
+        # Любой текст без активного состояния → автопоиск артефакта
+        results = search_arts(text)
+        if results:
+            _handle_search_art(chat_id, text)
+        else:
+            results2 = search_items(text)
+            if results2:
+                _handle_search_item(chat_id, text)
+            else:
+                _send_main(chat_id)
 
 def _handle_callback(chat_id, msg_id, data):
     if data == "main":            _send_main(chat_id, msg_id)
+    elif data.startswith("bought:"):
+        # Кнопка "Купил" из алерта
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            _, b_item, b_lk = parts
+            if _is_owner(chat_id):
+                db.exclude_lot(b_lk)
+                tg_edit(chat_id, msg_id,
+                        "✅ Лот убран из истории цен.\n<i>Он больше не влияет на расчёт ориентира.</i>",
+                        kb([("⬅️ Назад", f"art:{b_item}")]))
+            else:
+                tg_answer_text(msg_id, "Только владелец может помечать покупки.")
     elif data == "status":        _send_status(chat_id, msg_id)
     elif data == "watchlist":     _send_watchlist(chat_id, msg_id)
-    elif data == "settings":      _send_settings(chat_id, msg_id)
-    elif data == "settings_fresh":_send_settings(chat_id, msg_id)
+    elif data == "settings":
+        if _is_owner(chat_id): _send_settings(chat_id, msg_id)
+        else: tg_edit(chat_id, msg_id, "⛔ Только владелец может менять настройки.", kb([("⬅️","main")]))
+    elif data == "settings_fresh":
+        if _is_owner(chat_id): _send_settings(chat_id, msg_id)
+        else: _send_main(chat_id, msg_id)
     elif data == "search_art":
+        # Показываем топ-20 артефактов по кол-ву продаж + строку ввода
+        top = sorted(art_db.items(),
+                     key=lambda x: sum(1 for s in db.sales if s["item_id"]==x[0]),
+                     reverse=True)[:18]
+        rows = [[{"text": i["name"][:28], "callback_data": f"art:{iid}"}]
+                for iid, i in top]
+        rows.append([{"text":"⌨️ Поиск по названию →","callback_data":"type_art"}])
+        rows.append([{"text":"⬅️ Назад","callback_data":"main"}])
+        tg_edit(chat_id, msg_id,
+                "⚗️ <b>Выбери артефакт</b>\n<i>Топ по активности или поиск:</i>",
+                {"inline_keyboard": rows})
+    elif data == "type_art":
         _set(chat_id, "search_art")
-        tg_edit(chat_id, msg_id, "🔍 Введи название артефакта:", kb([("⬅️","main")]))
+        tg_edit(chat_id, msg_id, "🔍 Введи название артефакта (или часть):",
+                kb([("⬅️","main")]))
     elif data == "search_item":
+        top_c = list(db.custom_items.items())[:18]
+        rows  = [[{"text": nm[:28], "callback_data": f"cust:{iid}"}]
+                 for iid, nm in top_c]
+        rows.append([{"text":"⌨️ Поиск по названию →","callback_data":"type_item"}])
+        rows.append([{"text":"⬅️ Назад","callback_data":"main"}])
+        tg_edit(chat_id, msg_id,
+                "📦 <b>Мои предметы</b>\n<i>Выбери или найди новый:</i>",
+                {"inline_keyboard": rows})
+    elif data == "type_item":
         _set(chat_id, "search_item")
-        tg_edit(chat_id, msg_id, "📦 Введи название предмета:", kb([("⬅️","main")]))
+        tg_edit(chat_id, msg_id, "📦 Введи название предмета:",
+                kb([("⬅️","main")]))
     elif data.startswith("set:"):     _send_set_prompt(chat_id, msg_id, data[4:])
     elif data.startswith("art:"):     _send_art(chat_id, msg_id, data[4:])
     elif data.startswith("cust:"):    _send_custom(chat_id, msg_id, data[5:])
@@ -910,13 +1272,18 @@ def _handle_callback(chat_id, msg_id, data):
         tg_edit(chat_id, msg_id, f"🔕 Убран.",
                 kb([("📋 Список","watchlist"),("⬅️","main")]))
     elif data.startswith("chart:"):
-        iid = data[6:]
-        tg_edit(chat_id, msg_id, f"⏳ Генерирую график {art_name(iid)}…",
-                kb([("⬅️", f"art:{iid}")]))
-        png = make_chart(iid)
-        if png: tg_photo(chat_id, png, f"📈 {art_name(iid)}")
-        else:   tg_send("Данных пока нет.", chat_id)
-        _send_art(chat_id, None, iid)
+        iid    = data[6:]
+        is_art = iid in art_db
+        nm     = art_name(iid) if is_art else item_name(iid)
+        back   = f"art:{iid}" if is_art else f"cust:{iid}"
+        tg_edit(chat_id, msg_id, f"⏳ Генерирую график {nm}…", kb([("⬅️", back)]))
+        png = make_chart(iid) if is_art else make_chart_custom(iid)
+        if png:
+            tg_photo(chat_id, png, f"📈 {nm}")
+        else:
+            tg_send("Данных пока нет.", chat_id)
+        if is_art: _send_art(chat_id, None, iid)
+        else:      _send_custom(chat_id, None, iid)
 
 def _handle_update(upd):
     global _tg_offset
@@ -937,6 +1304,32 @@ def _handle_update(upd):
         _set(chat_id, ""); _send_main(chat_id)
     elif text.startswith("/status"):
         _send_status(chat_id)
+    elif text.startswith("/cleanalerts"):
+        if not _is_owner(chat_id):
+            tg_send("⛔ Только владелец.", chat_id); return
+        with db._lock:
+            old_cnt = len(db.sent_alerts)
+            db.sent_alerts.clear()
+        db.save()
+        tg_send(f"✅ Сброшено {old_cnt} алертов.", chat_id)
+    elif text.startswith("/cleandb"):
+        if not _is_owner(chat_id):
+            tg_send("⛔ Только владелец.", chat_id); return
+        from collections import Counter
+        with db._lock:
+            def bkt(s):
+                from datetime import datetime
+                ts = datetime.fromisoformat(s['sold_at'].replace('Z','+00:00')).timestamp()
+                return int(ts // 90)
+            by_bkt = Counter(bkt(s) for s in db.sales)
+            bad    = {b for b, c in by_bkt.items() if c > 25}
+            expanded = set()
+            for b in bad: expanded |= {b-1, b, b+1}
+            old_cnt  = len(db.sales)
+            db.sales = [s for s in db.sales if bkt(s) not in expanded]
+            removed  = old_cnt - len(db.sales)
+        db.save()
+        tg_send(f"🧹 Удалено {removed} из {old_cnt}. Осталось {len(db.sales)}.", chat_id)
     else:
         _handle_text(chat_id, text)
 
@@ -1109,12 +1502,11 @@ def make_chart(item_id: str) -> Optional[bytes]:
         ax.set_axisbelow(True)
 
         legend = ax.legend(
-            facecolor="#0d1321", edgecolor="#1f2937", borderwidth=1,
+            facecolor="#0d1321", edgecolor="#1f2937",
             labelcolor="#d1d5db", fontsize=7.5, loc="upper left",
             markerscale=0.8, framealpha=0.92,
-            title=qname, title_fontsize=7,
         )
-        legend.get_title().set_color(title_color)
+        legend.get_frame().set_linewidth(0.8)
 
     # ── Общий заголовок ──────────────────────────────────────────
     title = art_name(item_id) if item_id in art_db else item_name(item_id)
@@ -1214,7 +1606,7 @@ def make_chart_custom(item_id: str) -> Optional[bytes]:
 
 # Предохранитель аномалий: максимум допустимых выкупов за один цикл
 # (если за одну итерацию по всем предметам выкупов больше порога — пропускаем)
-MAX_BUYOUTS_PER_CYCLE = 20  # если за цикл >20 выкупов — признак аномалии
+MAX_BUYOUTS_PER_CYCLE = 100  # если за цикл >20 выкупов — признак аномалии
 
 _cycle_buyouts = 0  # сбрасывается в начале каждого цикла
 
@@ -1285,7 +1677,6 @@ def monitor_loop():
 
 # ═══════════════════════════════════════════════════════════════
 #  ВЕБ-ДАШБОРД
-#  ВЕБ-ДАШБОРД
 # ═══════════════════════════════════════════════════════════════
 
 _DASH = Path(__file__).parent / "dashboard.html"
@@ -1306,19 +1697,36 @@ class WebH(BaseHTTPRequestHandler):
                   "sales_count":sum(1 for s in sales if s["item_id"]==iid)}
                  for iid,i in art_db.items()],
                 key=lambda x:(-x["sales_count"],x["name"]))
+            # Build custom_items dict with their sales included
+            custom_items_data = {}
+            for iid, nm in db.custom_items.items():
+                name = nm if isinstance(nm, str) else nm.get("name", iid)
+                csales = [s for s in sales if s["item_id"] == iid]
+                custom_items_data[iid] = {
+                    "name":  name,
+                    "sales": csales,
+                }
             body = json.dumps({
-                "stats":      db.stats(),
-                "settings":   db.settings,
-                "arts":       arts,
-                "sales":      sales[-3000:],
-                "lots":       list(db.active_lots.values()),
-                "quality":    {str(k):{"name":v[0],"color":v[1]} for k,v in QUALITY.items()},
-                "ptn_groups": PTN_LABELS,
+                "stats":        db.stats(),
+                "settings":     db.settings,
+                "arts":         arts,
+                "sales":        sales[-3000:],
+                "lots":         list(db.active_lots.values()),
+                "quality":      {str(k):{"name":v[0],"color":v[1]} for k,v in QUALITY.items()},
+                "ptn_groups":   PTN_LABELS,
+                "custom_items": custom_items_data,
             }, ensure_ascii=False, default=str).encode("utf-8")
             self._ok("application/json; charset=utf-8", body,
                      [("Access-Control-Allow-Origin","*")])
+        elif self.path.startswith("/api/chart/custom/"):
+            iid = self.path.split("/")[-1]
+            png = make_chart_custom(iid)
+            if png: self._ok("image/png", png)
+            else:   self.send_response(404); self.end_headers()
         elif self.path.startswith("/api/chart/"):
-            png = make_chart(self.path.split("/")[-1])
+            iid = self.path.split("/")[-1]
+            # Route to correct chart function
+            png = make_chart(iid) if iid in art_db else make_chart_custom(iid)
             if png: self._ok("image/png", png)
             else:   self.send_response(404); self.end_headers()
         else:
