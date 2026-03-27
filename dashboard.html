@@ -3,481 +3,310 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Stalcraft · Artefact Monitor</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<title>Stalcraft Monitor</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
-
-:root {
-  --bg:       #080b11;
-  --bg2:      #0d1118;
-  --surface:  #111722;
-  --border:   #1c2438;
-  --border2:  #232d45;
-  --accent:   #00c8ff;
-  --accent2:  #0088bb;
-  --text:     #cdd9e8;
-  --muted:    #3d5070;
-  --q0: #9e9e9e; --q1: #8bc34a; --q2: #2196f3;
-  --q3: #9c27b0; --q4: #ff9800; --q5: #f44336;
-  --font: 'Rajdhani', sans-serif;
-  --mono: 'JetBrains Mono', monospace;
-}
-
-* { margin:0; padding:0; box-sizing:border-box; }
-html { height:100%; } body { min-height:100%; overflow-y:auto; }
-body { background:var(--bg); color:var(--text); font-family:var(--font); font-size:15px; }
-
-/* ── HEADER ────────────────────────────────── */
-header {
-  height:52px; display:flex; align-items:center; justify-content:space-between;
-  padding:0 24px; border-bottom:1px solid var(--border);
-  background:linear-gradient(90deg,#0c1528 0%,var(--bg) 100%);
-  flex-shrink:0;
-  position:sticky; top:0; z-index:100;
-}
-.logo { display:flex; align-items:center; gap:10px; }
-.logo svg { width:22px; height:22px; }
-.logo-text { font-size:1.15rem; font-weight:700; letter-spacing:3px;
-             color:var(--accent); text-transform:uppercase; }
-.logo-sub  { font-size:.7rem; color:var(--muted); font-family:var(--mono);
-             margin-left:4px; letter-spacing:1px; }
-#ts { font-family:var(--mono); font-size:.72rem; color:var(--muted); }
-
-/* ── STATS BAR ──────────────────────────────── */
-.stats-bar {
-  display:flex; gap:0; border-bottom:1px solid var(--border); flex-shrink:0;
-  position:sticky; top:52px; z-index:99; background:var(--bg);
-}
-.stat {
-  flex:1; padding:10px 20px; border-right:1px solid var(--border);
-  display:flex; flex-direction:column; gap:2px;
-}
-.stat:last-child { border-right:none; }
-.stat-v { font-size:1.6rem; font-weight:700; color:var(--accent);
-           font-family:var(--mono); line-height:1; }
-.stat-l { font-size:.65rem; color:var(--muted); text-transform:uppercase; letter-spacing:1.5px; }
-
-/* ── LAYOUT ─────────────────────────────────── */
-.layout {
-  display:grid;
-  grid-template-columns:260px 1fr;
-  min-height:calc(100vh - 52px - 44px);
-}
-
-/* ── SIDEBAR ────────────────────────────────── */
-.sidebar {
-  border-right:1px solid var(--border); display:flex; flex-direction:column;
-  background:var(--surface);
-  position:sticky; top:0;
-  height:calc(100vh - 52px - 44px);
-  overflow:hidden;
-}
-.sidebar-hd {
-  padding:10px 14px; font-size:.65rem; color:var(--muted); letter-spacing:2px;
-  text-transform:uppercase; border-bottom:1px solid var(--border); flex-shrink:0;
-  display:flex; align-items:center; justify-content:space-between;
-}
-.search-wrap { padding:8px 10px; border-bottom:1px solid var(--border); flex-shrink:0; }
-.search {
-  width:100%; padding:6px 10px; background:var(--bg2); border:1px solid var(--border2);
-  color:var(--text); font-family:var(--font); font-size:.88rem; border-radius:3px; outline:none;
-}
-.search:focus { border-color:var(--accent); }
-
-.art-list { overflow-y:auto; flex:1; }
-.art-item {
-  padding:9px 14px; cursor:pointer; border-bottom:1px solid #161d2c;
-  display:flex; align-items:center; justify-content:space-between;
-  transition:background .12s; position:relative;
-}
-.art-item:hover  { background:#151e30; }
-.art-item.active { background:#162440; }
-.art-item.active::before {
-  content:''; position:absolute; left:0; top:0; bottom:0; width:2px;
-  background:var(--accent);
-}
-.art-name  { font-size:.87rem; font-weight:500; }
-.art-badge {
-  font-size:.68rem; font-family:var(--mono); color:var(--muted);
-  background:var(--bg); padding:2px 6px; border-radius:2px; border:1px solid var(--border);
-}
-
-/* ── CONTENT ────────────────────────────────── */
-.content { padding:22px 26px; background:var(--bg); overflow:visible; }
-
-.panel-hd {
-  display:flex; align-items:center; justify-content:space-between;
-  margin-bottom:16px;
-}
-.panel-title { font-size:1.3rem; font-weight:700; color:var(--accent);
-               letter-spacing:1px; display:flex; align-items:center; gap:8px; }
-
-/* ── QUALITY LEGEND ─────────────────────────── */
-.q-legend { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; }
-.q-pill {
-  padding:4px 12px; border-radius:2px; font-size:.72rem; font-weight:600;
-  letter-spacing:.5px; cursor:pointer; transition:opacity .15s; user-select:none;
-}
-.q-pill.hidden { opacity:.35; }
-
-/* ── CHART ──────────────────────────────────── */
-.chart-card {
-  background:var(--surface); border:1px solid var(--border); border-radius:4px;
-  padding:18px; margin-bottom:20px; position:relative;
-}
-.chart-wrap { position:relative; height:340px; }
-
-/* ── TABLE ──────────────────────────────────── */
-.table-card {
-  background:var(--surface); border:1px solid var(--border); border-radius:4px;
-  overflow:hidden; margin-bottom:20px;
-}
-.table-hd { padding:10px 16px; font-size:.68rem; color:var(--muted);
-            letter-spacing:1.5px; text-transform:uppercase; border-bottom:1px solid var(--border);
-            display:flex; justify-content:space-between; }
-table { width:100%; border-collapse:collapse; font-size:.84rem; }
-th {
-  padding:8px 14px; text-align:left; color:var(--muted); font-size:.67rem;
-  font-weight:600; letter-spacing:1px; text-transform:uppercase;
-  border-bottom:1px solid var(--border); background:var(--bg2);
-}
-td { padding:8px 14px; border-bottom:1px solid #161d2c; }
-tr:hover td { background:#131b2e; }
-.q-dot { width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:6px;
-         vertical-align:middle; }
-.ptn { font-family:var(--mono); font-size:.75rem; color:#ffc107;
-       background:#1e1a00; padding:2px 6px; border-radius:2px; }
-.price-val { font-family:var(--mono); }
-
-/* ── EMPTY ───────────────────────────────────── */
-.empty { padding:80px 40px; text-align:center; color:var(--muted);
-         font-size:1rem; letter-spacing:1px; }
-.empty span { display:block; font-size:2rem; margin-bottom:12px; }
-
-/* ── SCROLLBAR ───────────────────────────────── */
-::-webkit-scrollbar { width:4px; height:4px; }
-::-webkit-scrollbar-track { background:transparent; }
-::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
-
-/* ── SCAN LINE overlay ───────────────────────── */
-body::after {
-  content:''; position:fixed; inset:0; pointer-events:none;
-  background:repeating-linear-gradient(0deg,
-    transparent 0px, transparent 2px,
-    rgba(0,0,0,.06) 2px, rgba(0,0,0,.06) 4px);
-  z-index:9999;
-}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{--bg:#070b12;--bg2:#0d1321;--surface:#111827;--border:#1f2937;--border2:#374151;--accent:#3b82f6;--accent2:#60a5fa;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--text:#e5e7eb;--muted:#6b7280;--font:'Inter',sans-serif;--mono:'JetBrains Mono',monospace;--q0:#939393;--q1:#4ad94b;--q2:#5555ff;--q3:#940394;--q4:#d14849;--q5:#ffaa00}
+*{margin:0;padding:0;box-sizing:border-box}html{height:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;min-height:100%;overflow-y:auto}
+header{position:sticky;top:0;z-index:200;background:#0a1020;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:50px}
+.logo{display:flex;align-items:center;gap:8px}.logo-text{font-weight:700;font-size:1rem;letter-spacing:1px;color:var(--accent2)}
+#ts{font-family:var(--mono);font-size:.7rem;color:var(--muted)}
+.stats-bar{position:sticky;top:50px;z-index:199;background:#0a1020;border-bottom:1px solid var(--border);display:flex}
+.stat{flex:1;padding:8px 20px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:1px}.stat:last-child{border-right:none}
+.sv{font-size:1.4rem;font-weight:700;color:var(--accent2);font-family:var(--mono);line-height:1.2}
+.sl{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.tabs{display:flex;border-bottom:1px solid var(--border);background:var(--bg2);position:sticky;top:94px;z-index:198}
+.tab{padding:10px 24px;cursor:pointer;font-size:.85rem;font-weight:500;color:var(--muted);border-bottom:2px solid transparent;transition:all .15s}
+.tab:hover{color:var(--text)}.tab.active{color:var(--accent2);border-color:var(--accent2)}
+.tab-content{display:none}.tab-content.visible{display:flex}
+.layout{display:flex;width:100%;min-height:calc(100vh - 144px)}
+.sidebar{width:260px;min-width:260px;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;position:sticky;top:144px;height:calc(100vh - 144px);overflow:hidden}
+.sidebar-hd{padding:10px 14px;font-size:.62rem;color:var(--muted);letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;justify-content:space-between}
+.search-wrap{padding:8px 10px;border-bottom:1px solid var(--border);flex-shrink:0}
+.search{width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:.82rem;border-radius:4px;outline:none}
+.search:focus{border-color:var(--accent)}
+.art-list{overflow-y:auto;flex:1}
+.art-item{padding:9px 14px;cursor:pointer;border-bottom:1px solid #161d2c;display:flex;align-items:center;justify-content:space-between;transition:background .1s;position:relative}
+.art-item:hover{background:#151e30}.art-item.active{background:#1e2d4a}
+.art-item.active::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}
+.art-name{font-size:.82rem;font-weight:500}
+.art-badge{font-size:.65rem;font-family:var(--mono);color:var(--muted);background:var(--bg);padding:2px 5px;border-radius:3px;border:1px solid var(--border)}
+.content{flex:1;padding:20px 24px;background:var(--bg);min-width:0}
+.q-pills{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px}
+.q-pill{padding:4px 12px;border-radius:20px;font-size:.72rem;font-weight:600;cursor:pointer;transition:opacity .15s;user-select:none}
+.q-pill.off{opacity:.3}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-bottom:16px;overflow:hidden}
+.card-hd{padding:10px 16px;font-size:.68rem;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{padding:8px 14px;text-align:left;color:var(--muted);font-size:.65rem;font-weight:600;letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--bg2)}
+td{padding:8px 14px;border-bottom:1px solid #161d2c}tr:hover td{background:#111827}
+.q-dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
+.ptn{font-family:var(--mono);font-size:.72rem;color:#fbbf24;background:#1a1500;padding:2px 6px;border-radius:3px}
+.mono{font-family:var(--mono)}
+.vg{color:#22c55e;font-size:.75rem}.vw{color:#eab308;font-size:.75rem}.vx{color:#22d3ee;font-size:.75rem}
+.empty{padding:60px;text-align:center;color:var(--muted);font-size:.95rem}
+.empty-icon{font-size:2.5rem;display:block;margin-bottom:10px}
+::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 </style>
 </head>
 <body>
-
 <header>
-  <div class="logo">
-    <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5">
-      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-    </svg>
-    <span class="logo-text">Artefact Monitor</span>
-    <span class="logo-sub">EU · STALCRAFT</span>
-  </div>
+  <div class="logo"><span style="font-size:1.4rem">⚗️</span><span class="logo-text">STALCRAFT MONITOR · EU</span></div>
   <span id="ts">—</span>
 </header>
-
 <div class="stats-bar">
-  <div class="stat"><span class="stat-v" id="s0">—</span><span class="stat-l">Продаж</span></div>
-  <div class="stat"><span class="stat-v" id="s1">—</span><span class="stat-l">Активных лотов</span></div>
-  <div class="stat"><span class="stat-v" id="s2">—</span><span class="stat-l">Арт. с данными</span></div>
-  <div class="stat"><span class="stat-v" id="s3">—</span><span class="stat-l">Отслеживается</span></div>
+  <div class="stat"><span class="sv" id="s0">—</span><span class="sl">Продаж</span></div>
+  <div class="stat"><span class="sv" id="s1">—</span><span class="sl">Активных лотов</span></div>
+  <div class="stat"><span class="sv" id="s2">—</span><span class="sl">С данными</span></div>
+  <div class="stat"><span class="sv" id="s3">—</span><span class="sl">Отслеживается</span></div>
 </div>
-
-<div class="layout">
-  <div class="sidebar">
-    <div class="sidebar-hd">
-      <span>Артефакты</span>
-      <span id="art-count" style="font-family:var(--mono)">—</span>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('arts')">⚗️ Артефакты</div>
+  <div class="tab" onclick="switchTab('custom')">📦 Мои предметы</div>
+</div>
+<div class="tab-content visible" id="tab-arts">
+  <div class="layout">
+    <div class="sidebar">
+      <div class="sidebar-hd"><span>Артефакты</span><span id="art-count" style="font-family:var(--mono)">—</span></div>
+      <div class="search-wrap"><input class="search" id="art-search" placeholder="Поиск…" oninput="renderArtList()"></div>
+      <div class="art-list" id="art-list"></div>
     </div>
-    <div class="search-wrap">
-      <input class="search" id="search" placeholder="Поиск по названию…" oninput="renderList()">
-    </div>
-    <div class="art-list" id="art-list"></div>
-  </div>
-
-  <div class="content" id="content">
-    <div class="empty"><span>⚗️</span>Выбери артефакт слева</div>
+    <div class="content" id="art-content"><div class="empty"><span class="empty-icon">⚗️</span>Выбери артефакт слева</div></div>
   </div>
 </div>
-
+<div class="tab-content" id="tab-custom">
+  <div class="layout">
+    <div class="sidebar">
+      <div class="sidebar-hd"><span>Предметы</span><span id="custom-count" style="font-family:var(--mono)">—</span></div>
+      <div class="search-wrap"><input class="search" id="cust-search" placeholder="Поиск…" oninput="renderCustList()"></div>
+      <div class="art-list" id="cust-list"></div>
+    </div>
+    <div class="content" id="cust-content"><div class="empty"><span class="empty-icon">📦</span>Выбери предмет слева</div></div>
+  </div>
+</div>
 <script>
-// ── State ─────────────────────────────────────────────────────────
-let data      = { stats:{}, arts:[], sales:[], lots:[], quality:{} };
-let selected  = null;
-let chart     = null;
-let hidden_q  = new Set();    // скрытые качества
+const QN={0:'Обычный',1:'Необычный',2:'Особый',3:'Редкий',4:'Исключительный',5:'Легендарный'};
+const QC={0:'#939393',1:'#4ad94b',2:'#5555ff',3:'#940394',4:'#d14849',5:'#ffaa00'};
+const PGL={'0':'без заточки','1-4':'⚡+1-4','5-9':'⚡+5-9','10-14':'⚡+10-14','15':'⚡+15'};
+const PGC={'0':'#6b7280','1-4':'#34d399','5-9':'#60a5fa','10-14':'#a78bfa','15':'#fbbf24'};
+const PGA={'0':.35,'1-4':.5,'5-9':.65,'10-14':.82,'15':1.};
+const PBGP='#070b12',PBGB='#111827',PGRID='#1f2937';
+let data={},selArt=null,selCust=null,hidQ=new Set();
 
-const Q_NAME  = { 0:'Обычный',1:'Необычный',2:'Особый',3:'Редкий',4:'Исключительный',5:'Легендарный' };
-const Q_COLOR = { 0:'#939393',1:'#4ad94b',2:'#5555ff',3:'#940394',4:'#d14849',5:'#ffaa00' };
-
-// ── Fetch ─────────────────────────────────────────────────────────
-async function fetchData() {
-  try {
-    const r = await fetch('/api/data');
-    data    = await r.json();
-    renderStats();
-    renderList();
-    if (selected) renderDetail(selected);
-    document.getElementById('ts').textContent =
-      'обновлено ' + new Date().toLocaleTimeString('ru');
-  } catch(e) { console.error(e); }
+function switchTab(n){
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['arts','custom'][i]===n));
+  document.getElementById('tab-arts').className='tab-content'+(n==='arts'?' visible':'');
+  document.getElementById('tab-custom').className='tab-content'+(n==='custom'?' visible':'');
 }
-
-// ── Stats bar ─────────────────────────────────────────────────────
-function renderStats() {
-  const s = data.stats || {};
-  document.getElementById('s0').textContent = fmt(s.total_sales   || 0);
-  document.getElementById('s1').textContent = fmt(s.active_lots   || 0);
-  document.getElementById('s2').textContent = fmt(s.items_with_data || 0);
-  document.getElementById('s3').textContent = fmt(s.items_tracked || 0);
+async function fetchData(){
+  try{
+    const r=await fetch('/api/data'); data=await r.json();
+    const s=data.stats||{};
+    document.getElementById('s0').textContent=fmt(s.total_sales||0);
+    document.getElementById('s1').textContent=fmt(s.active_lots||0);
+    document.getElementById('s2').textContent=fmt(s.items_with_data||0);
+    document.getElementById('s3').textContent=fmt(s.items_tracked||0);
+    renderArtList(); renderCustList();
+    if(selArt) renderArtDetail(selArt);
+    if(selCust) renderCustDetail(selCust);
+    document.getElementById('ts').textContent='обновлено '+new Date().toLocaleTimeString('ru');
+  }catch(e){console.error(e);}
 }
-
-// ── Sidebar list ──────────────────────────────────────────────────
-function renderList() {
-  const q    = document.getElementById('search').value.toLowerCase();
-  const arts = data.arts || [];
-  document.getElementById('art-count').textContent = arts.length;
-  const list = document.getElementById('art-list');
-  list.innerHTML = '';
-  arts
-    .filter(a => a.name.toLowerCase().includes(q))
-    .forEach(a => {
-      const d = document.createElement('div');
-      d.className = 'art-item' + (selected === a.id ? ' active' : '');
-      d.innerHTML =
-        `<span class="art-name">${a.name}</span>`+
-        `<span class="art-badge">${a.sales_count}</span>`;
-      d.onclick = () => { selected = a.id; renderList(); renderDetail(a.id); };
-      list.appendChild(d);
-    });
+function renderArtList(){
+  const q=(document.getElementById('art-search').value||'').toLowerCase();
+  const arts=(data.arts||[]).filter(a=>a.name.toLowerCase().includes(q));
+  document.getElementById('art-count').textContent=arts.length;
+  const list=document.getElementById('art-list'); list.innerHTML='';
+  arts.forEach(a=>{
+    const d=document.createElement('div');
+    d.className='art-item'+(selArt===a.id?' active':'');
+    d.innerHTML=`<span class="art-name">${a.name}</span><span class="art-badge">${a.sales_count}</span>`;
+    d.onclick=()=>{selArt=a.id;renderArtList();renderArtDetail(a.id);};
+    list.appendChild(d);
+  });
 }
-
-// ── Detail panel ──────────────────────────────────────────────────
-function renderDetail(itemId) {
-  const art   = (data.arts  || []).find(a => a.id === itemId);
-  const sales = (data.sales || []).filter(s => s.item_id === itemId);
-  const lots  = (data.lots  || []).filter(l => l.item_id === itemId);
-  if (!art) return;
-
-  // Group by quality
-  const byQ = {};
-  for (let q=0; q<=5; q++) byQ[q] = [];
-  sales.forEach(s => { if (byQ[s.qlt] !== undefined) byQ[s.qlt].push(s); });
-
-  // Legend pills
-  let legendHtml = '<div class="q-legend">';
-  for (let q=0; q<=5; q++) {
-    if (!byQ[q].length) continue;
-    const hidden = hidden_q.has(q) ? ' hidden' : '';
-    legendHtml += `<span class="q-pill${hidden}" `+
-      `style="background:${Q_COLOR[q]}18;color:${Q_COLOR[q]};border:1px solid ${Q_COLOR[q]}44" `+
-      `onclick="toggleQ(${q})">`+
-      `${Q_NAME[q]} <b>${byQ[q].length}</b></span>`;
+function renderCustList(){
+  const q=(document.getElementById('cust-search').value||'').toLowerCase();
+  const custs=Object.entries(data.custom_items||{}).filter(([id,i])=>i.name.toLowerCase().includes(q));
+  document.getElementById('custom-count').textContent=custs.length;
+  const list=document.getElementById('cust-list'); list.innerHTML='';
+  custs.forEach(([id,info])=>{
+    const d=document.createElement('div');
+    d.className='art-item'+(selCust===id?' active':'');
+    d.innerHTML=`<span class="art-name">${info.name}</span><span class="art-badge">${info.sales.length}</span>`;
+    d.onclick=()=>{selCust=id;renderCustList();renderCustDetail(id);};
+    list.appendChild(d);
+  });
+}
+function renderArtDetail(id){
+  const art=(data.arts||[]).find(a=>a.id===id);
+  const sales=(data.sales||[]).filter(s=>s.item_id===id);
+  const lots=(data.lots||[]).filter(l=>l.item_id===id);
+  if(!art) return;
+  const byQ={};for(let q=0;q<=5;q++)byQ[q]=[];
+  sales.forEach(s=>{if(byQ[s.qlt]!==undefined)byQ[s.qlt].push(s);});
+  let pills='<div class="q-pills">';
+  for(let q=0;q<=5;q++){
+    if(!byQ[q].length)continue;
+    pills+=`<span class="q-pill${hidQ.has(q)?' off':''}" onclick="toggleQ(${q})"
+      style="background:${QC[q]}18;color:${QC[q]};border:1px solid ${QC[q]}44">
+      ${QN[q]} <b>${byQ[q].length}</b></span>`;
   }
-  legendHtml += '</div>';
-
-  const content = document.getElementById('content');
-  content.innerHTML =
-    `<div class="panel-hd"><div class="panel-title">💎 ${art.name}</div></div>`+
-    legendHtml +
-    `<div class="chart-card"><div class="chart-wrap"><canvas id="chart-canvas"></canvas></div></div>`+
-    buildLotsTable(lots) +
-    buildSalesTable(sales);
-
-  drawChart(byQ);
+  pills+='</div>';
+  const content=document.getElementById('art-content');
+  content.innerHTML=`<div style="margin-bottom:10px"><b style="font-size:1.1rem;color:#f9fafb">${art.name}</b></div>`
+    +pills+`<div class="card"><div id="art-plotly" style="height:420px"></div></div>`
+    +lotsTable(lots)+salesTable(sales,true);
+  artPlot(byQ);
 }
-
-// ── Chart ─────────────────────────────────────────────────────────
-function drawChart(byQ) {
-  if (chart) { chart.destroy(); chart = null; }
-  const ctx = document.getElementById('chart-canvas');
-  if (!ctx) return;
-
-  const datasets = [];
-  for (let q=0; q<=5; q++) {
-    if (!byQ[q].length || hidden_q.has(q)) continue;
-    const sorted = [...byQ[q]].sort((a,b) => new Date(a.sold_at)-new Date(b.sold_at));
-    datasets.push({
-      label: Q_NAME[q],
-      data:  sorted.map(s => ({
-        x:   new Date(s.sold_at),
-        y:   Math.round(s.unit_price),
-        ptn: s.ptn,
-        amt: s.amount,
-      })),
-      borderColor:          Q_COLOR[q],
-      backgroundColor:      Q_COLOR[q]+'28',
-      pointBackgroundColor: Q_COLOR[q],
-      pointHoverRadius:     8,
-      pointRadius:          5,
-      tension:              0.25,
-      fill:                 false,
-    });
-  }
-
-  if (!datasets.length) return;
-
-  chart = new Chart(ctx, {
-    type: 'line',
-    data: { datasets },
-    options: {
-      responsive:true, maintainAspectRatio:false,
-      interaction:{ mode:'point', intersect:true },
-      plugins:{
-        legend:{
-          labels:{ color:'#8099bb', font:{ family:"'Rajdhani'", size:12 }, boxWidth:10 }
-        },
-        tooltip:{
-          backgroundColor:'#111722',
-          borderColor:'#1c2438', borderWidth:1,
-          titleColor:'#00c8ff', bodyColor:'#cdd9e8',
-          padding:10,
-          callbacks:{
-            title: items => new Date(items[0].parsed.x)
-              .toLocaleString('ru',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}),
-            label: item => {
-              const r = item.raw;
-              let s = ` ${item.dataset.label}: ${r.y.toLocaleString('ru')} руб./шт.`;
-              if (r.ptn != null && r.ptn > 0) s += `  ⚡ заточка +${r.ptn}`;
-              if (r.amt  > 1)                 s += `  ×${r.amt}`;
-              return s;
-            }
-          }
-        }
-      },
-      scales:{
-        x:{
-          type:'time',
-          time:{ tooltipFormat:'dd.MM HH:mm', displayFormats:{ hour:'dd.MM HH:mm', day:'dd.MM' }},
-          ticks:{ color:'#3d5070', maxTicksLimit:8 },
-          grid:{ color:'#1c2438' },
-        },
-        y:{
-          ticks:{
-            color:'#3d5070',
-            callback: v => v >= 1e6
-              ? (v/1e6).toFixed(1)+'M'
-              : v.toLocaleString('ru')+' ₽'
-          },
-          grid:{ color:'#1c2438' },
-        }
+function artPlot(byQ){
+  const traces=[];
+  for(let q=0;q<=5;q++){
+    if(!byQ[q].length||hidQ.has(q))continue;
+    const byPg={};
+    byQ[q].forEach(s=>{const pg=s.ptn_grp||'0';(byPg[pg]=byPg[pg]||[]).push(s);});
+    ['0','1-4','5-9','10-14','15'].forEach(pg=>{
+      if(!byPg[pg])return;
+      const pts=[...byPg[pg]].sort((a,b)=>a.sold_at.localeCompare(b.sold_at));
+      const xs=pts.map(s=>s.sold_at),ys=pts.map(s=>s.unit_price);
+      const med=calcMed(ys), c=PGC[pg]||QC[q], a=PGA[pg]||.6;
+      const maxY=Math.max(...ys,1);
+      traces.push({x:xs,y:ys,mode:'markers',type:'scatter',
+        name:`${QN[q]} · ${PGL[pg]}`,legendgroup:`q${q}`,
+        marker:{color:c,size:ys.map(y=>8+(y/maxY)*14),opacity:a,line:{color:'#111827',width:.5}},
+        text:pts.map(s=>{
+          const d=((s.unit_price-med)/med*100).toFixed(1);
+          const v=s.unit_price<med*.8?'🔥 Очень выгодно':s.unit_price>med*1.3?'⚠️ Выше нормы':'✅ В норме';
+          return `${QN[q]} · ${PGL[pg]}<br><b>${fmt(s.unit_price)}</b> ₽<br>vs медиана: ${d>0?'+':''}${d}%<br>${v}`;
+        }),
+        hovertemplate:'%{text}<extra></extra>'});
+      if(pts.length>=3){
+        const xn=pts.map(s=>new Date(s.sold_at).getTime()),x0=xn[0];
+        const lr=linReg(xn.map(x=>(x-x0)/3.6e6),ys);
+        const txs=[],tys_=[];
+        for(let i=0;i<=60;i++){const t=x0+(xn[xn.length-1]-x0)*i/60;txs.push(new Date(t).toISOString());tys_.push(lr.s*(t-x0)/3.6e6+lr.b);}
+        traces.push({x:txs,y:tys_,mode:'lines',type:'scatter',showlegend:false,legendgroup:`q${q}`,
+          line:{color:c,width:1,dash:'dot'},opacity:.35,hoverinfo:'skip'});
       }
-    }
+      if(xs.length){
+        const xs2=[...xs].sort();
+        traces.push({x:[xs2[0],xs2[xs2.length-1]],y:[med,med],mode:'lines',type:'scatter',
+          showlegend:false,legendgroup:`q${q}`,line:{color:c,width:1,dash:'dashdot'},opacity:.4,hoverinfo:'skip'});
+      }
+    });
+  }
+  Plotly.react('art-plotly',traces,{
+    paper_bgcolor:PBGP,plot_bgcolor:PBGB,
+    font:{color:'#e5e7eb',family:'Inter'},
+    margin:{t:20,r:20,b:60,l:80},
+    xaxis:{gridcolor:PGRID,zerolinecolor:PGRID,tickfont:{size:10,color:'#9ca3af'},type:'date',
+      rangeslider:{visible:true,bgcolor:'#0d1321',bordercolor:'#1f2937'}},
+    yaxis:{gridcolor:PGRID,tickfont:{size:10,color:'#9ca3af'},tickformat:',.0f',exponentformat:'none'},
+    legend:{bgcolor:'#0d1321',bordercolor:'#1f2937',borderwidth:1,font:{size:10,color:'#e5e7eb'}},
+    hovermode:'closest',dragmode:'zoom',
+  },{responsive:true,scrollZoom:true,displaylogo:false,modeBarButtonsToRemove:['lasso2d','select2d','toImage']});
+}
+function renderCustDetail(id){
+  const info=(data.custom_items||{})[id]; if(!info)return;
+  const sales=info.sales||[], lots=(data.lots||[]).filter(l=>l.item_id===id);
+  const content=document.getElementById('cust-content');
+  content.innerHTML=`<div style="margin-bottom:12px"><b style="font-size:1.1rem;color:#f9fafb">📦 ${info.name}</b></div>`
+    +`<div class="card"><div id="cust-plotly" style="height:360px"></div></div>`
+    +custLotsTable(lots)+custSalesTable(sales);
+  custPlot(sales,info.name);
+}
+function custPlot(sales,title){
+  if(!sales.length){document.getElementById('cust-plotly').innerHTML='<div class="empty"><span class="empty-icon">📊</span>Продаж пока нет</div>';return;}
+  const pts=[...sales].sort((a,b)=>a.sold_at.localeCompare(b.sold_at));
+  const xs=pts.map(s=>s.sold_at),ys=pts.map(s=>s.unit_price),med=calcMed(ys);
+  const traces=[{x:xs,y:ys,mode:'markers',type:'scatter',name:'Продажи',
+    marker:{color:'#60a5fa',size:8,opacity:.85,line:{color:'#111827',width:.5}},
+    text:pts.map(s=>{const d=((s.unit_price-med)/med*100).toFixed(1);return `<b>${fmt(s.unit_price)}</b> ₽<br>vs медиана: ${d>0?'+':''}${d}%`;}),
+    hovertemplate:'%{text}<extra></extra>'}];
+  if(ys.length>=3){
+    const xn=pts.map(s=>new Date(s.sold_at).getTime()),x0=xn[0];
+    const lr=linReg(xn.map(x=>(x-x0)/3.6e6),ys);
+    const txs=[],tys_=[];
+    for(let i=0;i<=60;i++){const t=x0+(xn[xn.length-1]-x0)*i/60;txs.push(new Date(t).toISOString());tys_.push(lr.s*(t-x0)/3.6e6+lr.b);}
+    traces.push({x:txs,y:tys_,mode:'lines',type:'scatter',name:'Тренд',line:{color:'#60a5fa',width:1.5,dash:'dot'},opacity:.4,hoverinfo:'skip'});
+  }
+  traces.push({x:[xs[0],xs[xs.length-1]],y:[med,med],mode:'lines',type:'scatter',
+    name:`Медиана: ${fmt(med)} ₽`,line:{color:'#fbbf24',width:1.5,dash:'dashdot'},opacity:.6,hoverinfo:'skip'});
+  Plotly.react('cust-plotly',traces,{
+    paper_bgcolor:PBGP,plot_bgcolor:PBGB,font:{color:'#e5e7eb',family:'Inter'},
+    margin:{t:20,r:20,b:60,l:80},
+    xaxis:{gridcolor:PGRID,tickfont:{size:10,color:'#9ca3af'},type:'date',
+      rangeslider:{visible:true,bgcolor:'#0d1321',bordercolor:'#1f2937'}},
+    yaxis:{gridcolor:PGRID,tickfont:{size:10,color:'#9ca3af'},tickformat:',.0f',exponentformat:'none'},
+    legend:{bgcolor:'#0d1321',bordercolor:'#1f2937',borderwidth:1,font:{size:10,color:'#e5e7eb'}},
+    hovermode:'closest',
+  },{responsive:true,scrollZoom:true,displaylogo:false,modeBarButtonsToRemove:['lasso2d','select2d','toImage']});
+}
+function lotsTable(lots){
+  if(!lots.length)return'';
+  const byQP={};
+  lots.forEach(l=>{const k=`${l.qlt||0}:${l.ptn_grp||'0'}`;(byQP[k]=byQP[k]||[]).push(l);});
+  let rows='';
+  Object.keys(byQP).sort().forEach(k=>{
+    const [q,pg]=k.split(':');
+    const sorted=[...byQP[k]].sort((a,b)=>(a.buyout||a.start||0)-(b.buyout||b.start||0));
+    sorted.forEach(l=>{
+      const amt=Math.max(l.amount||1,1),buy=l.buyout?Math.round(l.buyout/amt):null,sp=l.start?Math.round(l.start/amt):null;
+      rows+=`<tr><td><span class="q-dot" style="background:${QC[q]||'#fff'}"></span>${QN[q]||q}</td><td>${PGL[pg]||pg}</td>`+
+        `<td class="mono">${sp?sp.toLocaleString('ru')+' ₽':'—'}</td><td class="mono">${buy?'<b>'+buy.toLocaleString('ru')+'</b> ₽':'—'}</td><td>${amt>1?'×'+amt:'1'}</td></tr>`;
+    });
   });
+  return`<div class="card"><div class="card-hd"><span>📋 Активные лоты (${lots.length})</span></div>`+
+    `<table><thead><tr><th>Качество</th><th>Заточка</th><th>Старт/шт.</th><th>Выкуп/шт.</th><th>Кол-во</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
-
-function toggleQ(q) {
-  if (hidden_q.has(q)) hidden_q.delete(q); else hidden_q.add(q);
-  if (selected) renderDetail(selected);
-}
-
-// ── Lots table ────────────────────────────────────────────────────
-// Коэффициент наценки за заточку (за уровень)
-// ptn 15 = +20%, т.е. ~1.33% за уровень
-const PTN_BONUS_PER_LEVEL = 0.0133;
-
-function normalizePrice(price, ptn) {
-  // Приводим цену к "без заточки" эквиваленту для честного сравнения
-  if (!ptn || ptn <= 0) return price;
-  return Math.round(price / (1 + ptn * PTN_BONUS_PER_LEVEL));
-}
-
-function ptnLabel(ptn) {
-  if (!ptn || ptn <= 0) return '—';
-  const bonus = Math.round(ptn * PTN_BONUS_PER_LEVEL * 100);
-  return `<span class="ptn">+${ptn}</span> <span style="color:#888;font-size:.7rem">(+${bonus}%)</span>`;
-}
-
-function buildLotsTable(lots) {
-  if (!lots.length) return '';
-  const sorted = [...lots].sort((a,b) => {
-    // Сортировка по нормализованной цене (убираем наценку заточки)
-    const pa = normalizePrice(a.buyout||a.start||0, a.ptn);
-    const pb = normalizePrice(b.buyout||b.start||0, b.ptn);
-    // Сначала по качеству, потом по цене
-    if (a.qlt !== b.qlt) return a.qlt - b.qlt;
-    return pa - pb;
-  });
-  let rows = sorted.map(l => {  // ВСЕ лоты без ограничения
-    const qn   = Q_NAME[l.qlt]  || l.qlt;
-    const qc   = Q_COLOR[l.qlt] || '#fff';
-    const amt  = Math.max(l.amount||1, 1);
-    const buyRaw  = l.buyout ? Math.round(l.buyout/amt) : null;
-    const buyNorm = buyRaw ? normalizePrice(buyRaw, l.ptn) : null;
-    const spRaw   = l.start ? Math.round(l.start/amt) : null;
-
-    // Если есть заточка — показываем и реальную цену и нормализованную
-    const buyCell = buyRaw
-      ? `<span class="price-val">${buyRaw.toLocaleString('ru')} ₽</span>`
-        + (l.ptn > 0 ? `<br><span style="color:#888;font-size:.72rem">≈${buyNorm.toLocaleString('ru')} без заточки</span>` : '')
-      : '—';
-    const spCell  = spRaw ? `${spRaw.toLocaleString('ru')} ₽` : '—';
-
-    return `<tr>
-      <td><span class="q-dot" style="background:${qc}"></span>${qn}</td>
-      <td>${ptnLabel(l.ptn)}</td>
-      <td class="price-val">${spCell}</td>
-      <td>${buyCell}</td>
-      <td>${amt > 1 ? '×'+amt : '1'}</td>
-      <td>${l.seller||'?'}</td>
-    </tr>`;
+function salesTable(sales,withV){
+  if(!sales.length)return'<div class="empty"><span class="empty-icon">📊</span>Продаж пока нет</div>';
+  const byK={};
+  sales.forEach(s=>{const k=`${s.qlt}:${s.ptn_grp||'0'}`;(byK[k]=byK[k]||[]).push(s.unit_price);});
+  const meds={};Object.keys(byK).forEach(k=>{meds[k]=calcMed(byK[k]);});
+  const sorted=[...sales].sort((a,b)=>b.sold_at.localeCompare(a.sold_at));
+  let rows=sorted.map(s=>{
+    const qc=QC[s.qlt]||'#fff',pg=s.ptn_grp||'0';
+    const ptnL={'0':'—','1-4':'⚡+1-4','5-9':'⚡+5-9','10-14':'⚡+10-14','15':'⚡+15'}[pg]||pg;
+    const dt=new Date(s.sold_at).toLocaleString('ru',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    let vc='';
+    if(withV){const m=meds[`${s.qlt}:${pg}`];if(m){const d=(s.unit_price-m)/m*100;vc=d<-20?`<span class="vx">🔥 −${Math.abs(d).toFixed(0)}%</span>`:d<-8?`<span class="vg">✅ −${Math.abs(d).toFixed(0)}%</span>`:d>30?`<span class="vw">⚠️ +${d.toFixed(0)}%</span>`:`<span style="color:var(--muted);font-size:.72rem">≈норма</span>`;}}
+    return`<tr><td><span class="q-dot" style="background:${qc}"></span>${QN[s.qlt]||s.qlt}</td><td>${ptnL}</td>`+
+      `<td class="mono">${Math.round(s.unit_price).toLocaleString('ru')} ₽</td><td>${s.amount>1?'×'+s.amount:'—'}</td>`+
+      `<td class="mono">${Math.round(s.price).toLocaleString('ru')} ₽</td><td>${vc}</td>`+
+      `<td style="color:var(--muted);font-size:.75rem">${dt}</td></tr>`;
   }).join('');
-  return `<div class="table-card">
-    <div class="table-hd">
-      <span>📋 Активные лоты (${lots.length})</span>
-      <span style="font-family:var(--mono);font-size:.7rem;color:var(--muted)">сортировка: качество → цена без заточки</span>
-    </div>
-    <table><thead><tr>
-      <th>Качество</th><th>Заточка</th><th>Старт/шт.</th><th>Выкуп/шт.</th><th>Кол-во</th><th>Продавец</th>
-    </tr></thead><tbody>${rows}</tbody></table></div>`;
+  return`<div class="card"><div class="card-hd"><span>📜 История продаж (${sales.length})</span><span style="font-size:.7rem;color:var(--muted)">оценка vs медиана группы</span></div>`+
+    `<table><thead><tr><th>Качество</th><th>Заточка</th><th>Цена/шт.</th><th>Кол-во</th><th>Итого</th><th>Оценка</th><th>Время</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
-
-// ── Sales table ───────────────────────────────────────────────────
-function buildSalesTable(sales) {
-  if (!sales.length) return '<div class="empty"><span>📊</span>Продаж пока нет</div>';
-  const sorted = [...sales].sort((a,b) => new Date(b.sold_at)-new Date(a.sold_at));
-  let rows = sorted.map(s => {  // ВСЕ продажи
-    const qn      = Q_NAME[s.qlt]  || s.qlt;
-    const qc      = Q_COLOR[s.qlt] || '#fff';
-    const dt      = new Date(s.sold_at).toLocaleString('ru',
-      {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
-    const unitNorm = normalizePrice(Math.round(s.unit_price), s.ptn);
-    const unitCell = s.ptn > 0
-      ? `${Math.round(s.unit_price).toLocaleString('ru')} ₽<br><span style="color:#888;font-size:.72rem">≈${unitNorm.toLocaleString('ru')} норм.</span>`
-      : `${Math.round(s.unit_price).toLocaleString('ru')} ₽`;
-    return `<tr>
-      <td><span class="q-dot" style="background:${qc}"></span>${qn}</td>
-      <td>${ptnLabel(s.ptn)}</td>
-      <td class="price-val">${unitCell}</td>
-      <td>${s.amount > 1 ? '×'+s.amount : '—'}</td>
-      <td class="price-val">${Math.round(s.price).toLocaleString('ru')} ₽</td>
-      <td>${dt}</td>
-    </tr>`;
+function custLotsTable(lots){
+  if(!lots.length)return'';
+  const sorted=[...lots].sort((a,b)=>(a.buyout||a.start||0)-(b.buyout||b.start||0));
+  let rows=sorted.map(l=>{const amt=Math.max(l.amount||1,1),buy=l.buyout?Math.round(l.buyout/amt):null,sp=l.start?Math.round(l.start/amt):null;
+    return`<tr><td class="mono">${sp?sp.toLocaleString('ru')+' ₽':'—'}</td><td class="mono">${buy?'<b>'+buy.toLocaleString('ru')+'</b> ₽':'—'}</td><td>${amt>1?'×'+amt:'1'}</td></tr>`;}).join('');
+  return`<div class="card"><div class="card-hd"><span>📋 Активные лоты (${lots.length})</span></div>`+
+    `<table><thead><tr><th>Старт/шт.</th><th>Выкуп/шт.</th><th>Кол-во</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+function custSalesTable(sales){
+  if(!sales.length)return'<div class="empty"><span class="empty-icon">📊</span>Продаж пока нет</div>';
+  const med=calcMed(sales.map(s=>s.unit_price));
+  const sorted=[...sales].sort((a,b)=>b.sold_at.localeCompare(a.sold_at));
+  let rows=sorted.map(s=>{
+    const d=(s.unit_price-med)/med*100;
+    const vc=d<-20?`<span class="vx">🔥 −${Math.abs(d).toFixed(0)}%</span>`:d<-8?`<span class="vg">✅ −${Math.abs(d).toFixed(0)}%</span>`:d>30?`<span class="vw">⚠️ +${d.toFixed(0)}%</span>`:`<span style="color:var(--muted);font-size:.72rem">≈норма</span>`;
+    const dt=new Date(s.sold_at).toLocaleString('ru',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    return`<tr><td class="mono">${Math.round(s.unit_price).toLocaleString('ru')} ₽</td><td>${s.amount>1?'×'+s.amount:'—'}</td><td class="mono">${Math.round(s.price).toLocaleString('ru')} ₽</td><td>${vc}</td><td style="color:var(--muted);font-size:.75rem">${dt}</td></tr>`;
   }).join('');
-  return `<div class="table-card">
-    <div class="table-hd">
-      <span>📜 История продаж (${sales.length})</span>
-      <span style="font-family:var(--mono);font-size:.7rem;color:var(--muted)">все записи</span>
-    </div>
-    <table><thead><tr>
-      <th>Качество</th><th>Заточка</th><th>Цена/шт.</th><th>Кол-во</th><th>Итого</th><th>Время</th>
-    </tr></thead><tbody>${rows}</tbody></table></div>`;
+  return`<div class="card"><div class="card-hd"><span>📜 История (${sales.length})</span><span style="font-size:.7rem;color:var(--muted)">медиана: ${fmt(med)} ₽</span></div>`+
+    `<table><thead><tr><th>Цена/шт.</th><th>Кол-во</th><th>Итого</th><th>Оценка</th><th>Время</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
-
-// ── Utils ─────────────────────────────────────────────────────────
-function fmt(n) { return Number(n).toLocaleString('ru'); }
-
-// ── Init ──────────────────────────────────────────────────────────
-fetchData();
-setInterval(fetchData, 25000);
+function toggleQ(q){if(hidQ.has(q))hidQ.delete(q);else hidQ.add(q);if(selArt)renderArtDetail(selArt);}
+function fmt(n){return Number(n).toLocaleString('ru');}
+function calcMed(a){if(!a.length)return 0;const s=[...a].sort((x,y)=>x-y),m=Math.floor(s.length/2);return s.length%2?s[m]:(s[m-1]+s[m])/2;}
+function linReg(xs,ys){const n=xs.length,mx=xs.reduce((a,b)=>a+b,0)/n,my=ys.reduce((a,b)=>a+b,0)/n;const num=xs.reduce((s,x,i)=>s+(x-mx)*(ys[i]-my),0),den=xs.reduce((s,x)=>s+(x-mx)**2,0);const sl=den?num/den:0;return{s:sl,b:my-sl*mx};}
+fetchData();setInterval(fetchData,20000);
 </script>
 </body>
 </html>
