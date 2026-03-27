@@ -126,6 +126,9 @@ class DB:
         }
         self.user_settings : dict = {}  # chat_id -> {discount_pct, ...}
         self.excluded_lots : set  = set()  # lot_keys помеченные как "купил"
+        self.vip_users     : set  = set()  # получают алерты без задержки
+        self.subscribers   : set  = set()  # все подписавшиеся на алерты
+        self.pending_alerts: list = []     # [(send_at, chat_id, msg, markup)]
         self._load()
 
     def _load(self):
@@ -142,6 +145,8 @@ class DB:
             self.settings.update({k: saved_s[k] for k in self.settings if k in saved_s})
             self.user_settings  = raw.get("user_settings", {})
             self.excluded_lots  = set(raw.get("excluded_lots", []))
+            self.vip_users      = set(raw.get("vip_users", []))
+            self.subscribers    = set(raw.get("subscribers", []))
             log.info(f"БД: {len(self.sales)} продаж, {len(self.active_lots)} лотов")
         except Exception as e:
             log.error(f"Загрузка БД: {e}")
@@ -157,6 +162,8 @@ class DB:
                 "settings":      self.settings,
                 "user_settings": self.user_settings,
                 "excluded_lots": list(self.excluded_lots)[-5000:],
+                "vip_users":     list(self.vip_users),
+                "subscribers":   list(self.subscribers),
                 "saved_at":      _now(),
             }
         try:
@@ -188,6 +195,25 @@ class DB:
         with self._lock:
             self.excluded_lots.add(lot_key)
         self.save()
+
+    def vip_add(self, chat_id: str):
+        with self._lock: self.vip_users.add(str(chat_id))
+        self.save()
+
+    def vip_del(self, chat_id: str):
+        with self._lock: self.vip_users.discard(str(chat_id))
+        self.save()
+
+    def sub_add(self, chat_id: str):
+        with self._lock: self.subscribers.add(str(chat_id))
+        self.save()
+
+    def sub_del(self, chat_id: str):
+        with self._lock: self.subscribers.discard(str(chat_id))
+        self.save()
+
+    def is_vip(self, chat_id: str) -> bool:
+        return str(chat_id) in self.vip_users
 
     def is_excluded(self, sale: dict) -> bool:
         return sale.get("lot_key","") in self.excluded_lots
@@ -807,7 +833,20 @@ def check_alert(item_id: str, lot: dict, qlt: int, ptn, is_art: bool = True):
 
     msg    = _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art, analysis)
     markup = _bought_markup(item_id, lk)
+
+    # Владелец и VIP — сразу
     tg_send(msg, TELEGRAM_CHAT_ID, markup)
+    for vip in list(db.vip_users):
+        if vip != str(TELEGRAM_CHAT_ID):
+            tg_send(msg, vip, markup)
+
+    # Обычные подписчики — через 5 минут
+    DELAY_SECS = 300
+    send_at = time.time() + DELAY_SECS
+    for sub in list(db.subscribers):
+        if sub != str(TELEGRAM_CHAT_ID) and sub not in db.vip_users:
+            db.pending_alerts.append((send_at, sub, msg, markup))
+
     db.mark_sent(key)
     log.info(f"ALERT: {art_name(item_id)} q{qlt} {pg} -{disc:.1f}%")
 
@@ -1083,10 +1122,31 @@ def _send_settings(chat_id, msg_id):
     markup = kb(
         [("📉 Изменить порог %",    "set:discount_pct"),
          ("💰 Изменить мин. разницу","set:min_price_diff")],
-        [("📊 Изменить мин. продаж", "set:min_sales"),
+        [("📊 Изменить мин. продаж", "set:min_sales")],
+        [("👑 Управление VIP",       "admin_vip"),
          ("⬅️ Назад",               "main")],
     )
     tg_edit(chat_id, msg_id, txt, markup)
+
+
+def _send_admin_vip(chat_id, msg_id):
+    vips  = list(db.vip_users)
+    subs  = list(db.subscribers)
+    lines = ["👑 <b>VIP пользователи</b> (алерты без задержки)\n"]
+    if vips:
+        for v in vips:
+            tag = " (владелец)" if v == str(TELEGRAM_CHAT_ID) else ""
+            lines.append(f"• <code>{v}</code>{tag}")
+    else:
+        lines.append("  Список пуст")
+    lines.append(f"\n📢 Всего подписчиков: <b>{len(subs)}</b>")
+    lines.append("<i>Подписчики получают алерты с задержкой 5 мин.</i>")
+    markup = kb(
+        [("➕ Добавить VIP",  "vip_add_prompt"),
+         ("➖ Убрать VIP",   "vip_del_prompt")],
+        [("⬅️ Назад",        "settings")],
+    )
+    tg_edit(chat_id, msg_id, "\n".join(lines), markup)
 
 def _send_set_prompt(chat_id, msg_id, key):
     meta = {
@@ -1172,6 +1232,17 @@ def _handle_text(chat_id, text):
         _handle_search_art(chat_id, text)
     elif state == "search_item":
         _handle_search_item(chat_id, text)
+    elif state == "vip_add":
+        if _is_owner(chat_id):
+            new_vip = text.strip()
+            if new_vip.lstrip("-").isdigit():
+                db.vip_add(new_vip)
+                tg_send(f"✅ <code>{new_vip}</code> добавлен в VIP.\n"
+                        "Теперь он будет получать алерты без задержки.", chat_id,
+                        kb([("👑 Управление VIP", "admin_vip_fresh")]))
+            else:
+                tg_send("❌ Неверный формат. chat_id — это число (может быть отрицательным для групп).",
+                        chat_id, kb([("👑 VIP", "admin_vip_fresh")]))
     elif state.startswith("set:"):
         key = state[4:]
         try:
@@ -1219,6 +1290,8 @@ def _handle_callback(chat_id, msg_id, data):
     elif data == "settings_fresh":
         if _is_owner(chat_id): _send_settings(chat_id, msg_id)
         else: _send_main(chat_id, msg_id)
+    elif data == "admin_vip_fresh":
+        if _is_owner(chat_id): _send_admin_vip(chat_id, msg_id)
     elif data == "search_art":
         # Показываем топ-20 артефактов по кол-ву продаж + строку ввода
         top = sorted(art_db.items(),
@@ -1249,6 +1322,27 @@ def _handle_callback(chat_id, msg_id, data):
         tg_edit(chat_id, msg_id, "📦 Введи название предмета:",
                 kb([("⬅️","main")]))
     elif data.startswith("set:"):     _send_set_prompt(chat_id, msg_id, data[4:])
+    elif data == "admin_vip":
+        if _is_owner(chat_id): _send_admin_vip(chat_id, msg_id)
+    elif data == "vip_add_prompt":
+        if _is_owner(chat_id):
+            _set(chat_id, "vip_add")
+            tg_edit(chat_id, msg_id,
+                    "👑 Введи <b>chat_id</b> пользователя которого хочешь добавить в VIP:\n"
+                    "<i>(пользователь должен написать /start боту чтобы узнать свой ID)</i>",
+                    kb([("❌ Отмена", "admin_vip")]))
+    elif data == "vip_del_prompt":
+        if _is_owner(chat_id):
+            vips = [v for v in db.vip_users if v != str(TELEGRAM_CHAT_ID)]
+            if not vips:
+                tg_edit(chat_id, msg_id, "Список VIP пуст.", kb([("⬅️", "admin_vip")])); return
+            rows = [[(f"❌ {v}", f"vip_del:{v}")] for v in vips]
+            rows.append([("⬅️ Назад", "admin_vip")])
+            tg_edit(chat_id, msg_id, "Выбери кого убрать из VIP:", kb(*rows))
+    elif data.startswith("vip_del:"):
+        if _is_owner(chat_id):
+            v = data[8:]; db.vip_del(v)
+            tg_edit(chat_id, msg_id, f"✅ <code>{v}</code> убран из VIP.", kb([("⬅️", "admin_vip")]))
     elif data.startswith("art:"):     _send_art(chat_id, msg_id, data[4:])
     elif data.startswith("cust:"):    _send_custom(chat_id, msg_id, data[5:])
     elif data.startswith("lots:"):    _send_lots(chat_id, msg_id, data[5:])
@@ -1301,7 +1395,20 @@ def _handle_update(upd):
     chat_id = str(msg["chat"]["id"])
     text    = msg.get("text","").strip()
     if text.startswith("/start") or text.startswith("/menu"):
-        _set(chat_id, ""); _send_main(chat_id)
+        _set(chat_id, "")
+        # Показываем chat_id чтобы пользователь мог передать владельцу для VIP
+        if not _is_owner(chat_id):
+            tg_send(f"👋 Твой chat_id: <code>{chat_id}</code>\n"
+                    "Передай его владельцу если хочешь VIP-алерты без задержки.\n"
+                    "Или /subscribe чтобы получать алерты с задержкой 5 мин.", chat_id)
+        _send_main(chat_id)
+    elif text.startswith("/subscribe"):
+        db.sub_add(chat_id)
+        tg_send("✅ Подписан на алерты! Буду присылать выгодные лоты с задержкой 5 мин.", chat_id,
+                kb([("📋 Меню", "main")]))
+    elif text.startswith("/unsubscribe"):
+        db.sub_del(chat_id)
+        tg_send("🔕 Отписан от алертов.", chat_id)
     elif text.startswith("/status"):
         _send_status(chat_id)
     elif text.startswith("/cleanalerts"):
@@ -1332,6 +1439,21 @@ def _handle_update(upd):
         tg_send(f"🧹 Удалено {removed} из {old_cnt}. Осталось {len(db.sales)}.", chat_id)
     else:
         _handle_text(chat_id, text)
+
+def _flush_pending_alerts():
+    """Отправляет отложенные алерты подписчикам когда наступает время."""
+    while True:
+        time.sleep(10)
+        now = time.time()
+        still_pending = []
+        for item in list(db.pending_alerts):
+            send_at, chat_id, msg, markup = item
+            if now >= send_at:
+                tg_send(msg, chat_id, markup)
+            else:
+                still_pending.append(item)
+        db.pending_alerts = still_pending
+
 
 def tg_polling_loop():
     if not TELEGRAM_TOKEN:
@@ -1774,8 +1896,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     log.info(f"Артефактов: {len(art_db)} | Предметов: {len(item_db)}")
-    threading.Thread(target=start_web,       daemon=True).start()
-    threading.Thread(target=tg_polling_loop, daemon=True).start()
+    threading.Thread(target=start_web,            daemon=True).start()
+    threading.Thread(target=tg_polling_loop,      daemon=True).start()
+    threading.Thread(target=_flush_pending_alerts, daemon=True).start()
     log.info(f"Дашборд: http://localhost:{WEB_PORT}")
 
     try:
