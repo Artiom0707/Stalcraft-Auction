@@ -129,6 +129,10 @@ class DB:
         self.vip_users     : set  = set()  # получают алерты без задержки
         self.subscribers   : set  = set()  # все подписавшиеся на алерты
         self.pending_alerts: list = []     # [(send_at, chat_id, msg, markup)]
+        # my_inventory: {chat_id -> {inv_key -> {item_id,name,buy_price,sell_price,amount,bought_at}}}
+        self.my_inventory  : dict = {}
+        # my_sold: [{chat_id,item_id,name,buy_price,sell_price,amount,profit,sold_at}]
+        self.my_sold       : list = []
         self._load()
 
     def _load(self):
@@ -147,6 +151,8 @@ class DB:
             self.excluded_lots  = set(raw.get("excluded_lots", []))
             self.vip_users      = set(raw.get("vip_users", []))
             self.subscribers    = set(raw.get("subscribers", []))
+            self.my_inventory   = raw.get("my_inventory", {})
+            self.my_sold        = raw.get("my_sold", [])
             log.info(f"БД: {len(self.sales)} продаж, {len(self.active_lots)} лотов")
         except Exception as e:
             log.error(f"Загрузка БД: {e}")
@@ -164,6 +170,8 @@ class DB:
                 "excluded_lots": list(self.excluded_lots)[-5000:],
                 "vip_users":     list(self.vip_users),
                 "subscribers":   list(self.subscribers),
+                "my_inventory":  self.my_inventory,
+                "my_sold":       self.my_sold[-5000:],
                 "saved_at":      _now(),
             }
         try:
@@ -217,6 +225,84 @@ class DB:
 
     def is_excluded(self, sale: dict) -> bool:
         return sale.get("lot_key","") in self.excluded_lots
+
+    # ── Инвентарь / Мои товары ────────────────────────────────
+
+    def inv_add(self, chat_id: str, item_id: str, iname: str,
+                buy_price: float, sell_price: float, amount: int):
+        """Добавить/обновить позицию в инвентаре пользователя."""
+        with self._lock:
+            user_inv = self.my_inventory.setdefault(str(chat_id), {})
+            key = f"{item_id}:{int(buy_price)}:{int(sell_price)}"
+            if key in user_inv:
+                user_inv[key]["amount"] += amount
+            else:
+                user_inv[key] = {
+                    "item_id":    item_id,
+                    "name":       iname,
+                    "buy_price":  buy_price,
+                    "sell_price": sell_price,
+                    "amount":     amount,
+                    "bought_at":  _now(),
+                }
+        self.save()
+
+    def inv_del(self, chat_id: str, inv_key: str):
+        """Удалить позицию из инвентаря (ручное удаление)."""
+        with self._lock:
+            self.my_inventory.get(str(chat_id), {}).pop(inv_key, None)
+        self.save()
+
+    def inv_sold_one(self, chat_id: str, inv_key: str, amount: int = 1):
+        """Пометить позицию как проданную. Возвращает запись или None."""
+        with self._lock:
+            user_inv = self.my_inventory.get(str(chat_id), {})
+            if inv_key not in user_inv:
+                return None
+            item = user_inv[inv_key]
+            amt_sold = min(amount, item["amount"])
+            profit = (item["sell_price"] * 0.968 - item["buy_price"]) * amt_sold
+            entry = {
+                "chat_id":    str(chat_id),
+                "item_id":    item["item_id"],
+                "name":       item["name"],
+                "buy_price":  item["buy_price"],
+                "sell_price": item["sell_price"],
+                "amount":     amt_sold,
+                "profit":     profit,
+                "sold_at":    _now(),
+            }
+            self.my_sold.append(entry)
+            item["amount"] -= amt_sold
+            if item["amount"] <= 0:
+                del user_inv[inv_key]
+        self.save()
+        return entry
+
+    def inv_list(self, chat_id: str) -> dict:
+        return dict(self.my_inventory.get(str(chat_id), {}))
+
+    def inv_count_cheaper(self, item_id: str, sell_price: float) -> int:
+        """Считает активные лоты с ценой ниже sell_price."""
+        lots = self.lots_for(item_id)
+        count = 0
+        for lot in lots:
+            bp = lot.get("buyout")
+            if bp is None:
+                continue
+            amt = max(lot.get("amount", 1) or 1, 1)
+            if bp / amt < sell_price:
+                count += 1
+        return count
+
+    def roi(self, chat_id: str, days: int) -> float:
+        """Чистая прибыль за последние N дней."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        return sum(
+            e.get("profit", 0)
+            for e in self.my_sold
+            if e.get("chat_id") == str(chat_id) and e.get("sold_at", "") >= cutoff
+        )
 
     def lot_key(self, lot: dict) -> str:
         raw = lot.get("id")
@@ -791,9 +877,10 @@ def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
 
 
 def _bought_markup(item_id: str, lk: str) -> dict:
-    """Inline-кнопка 'Купил' под алертом."""
+    """Inline-кнопки 'Купил' и 'Купил несколько' под алертом."""
     return {"inline_keyboard": [[
-        {"text": "✅ Купил — убрать из истории", "callback_data": f"bought:{item_id}:{lk}"}
+        {"text": "✅ Купил (1 шт.)",     "callback_data": f"bought:{item_id}:{lk}"},
+        {"text": "🛒 Купил несколько",   "callback_data": f"bought_multi:{item_id}:{lk}"},
     ]]}
 
 
@@ -918,6 +1005,11 @@ def kb(*rows) -> dict:
 
 _tg_offset  = 0
 _user_state : dict = {}
+# Сессии многоступенчатых покупок: chat_id -> {item_id, lk, entries: [], msg_id}
+_inv_pending: dict = {}
+# Кулдаун алертов о конкурентах: chat_id -> {item_id -> timestamp последнего алерта}
+_comp_alerted: dict = {}
+COMP_ALERT_COOLDOWN = 900  # 15 минут
 
 def _state(chat_id): return _user_state.get(chat_id, "")
 def _set(chat_id, s): _user_state[chat_id] = s
@@ -926,6 +1018,9 @@ def _set(chat_id, s): _user_state[chat_id] = s
 
 def _is_owner(chat_id: str) -> bool:
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
+
+def _is_vip_or_owner(chat_id: str) -> bool:
+    return _is_owner(chat_id) or db.is_vip(str(chat_id))
 
 
 def _main_kb(chat_id: str = "") -> dict:
@@ -940,6 +1035,11 @@ def _main_kb(chat_id: str = "") -> dict:
         [{"text":"📋 Мой список","callback_data":"watchlist"},
          {"text":"📊 Статус","callback_data":"status"}],
     ]
+    if _is_vip_or_owner(chat_id):
+        rows.append([
+            {"text": "🛒 Мои товары",   "callback_data": "my_items"},
+            {"text": "🏦 Мой кабинет",  "callback_data": "my_cabinet"},
+        ])
     if _is_owner(chat_id):
         rows.append([{"text":"⚙️ Настройки","callback_data":"settings"}])
     rows.append(web_row)
@@ -1171,7 +1271,7 @@ def _send_status(chat_id, msg_id=None):
         f"Отслеживается:  <b>{st['items_tracked']}</b>\n"
         f"С: {(st['oldest'] or '—')[:19]}\n\n"
         f"⚙️ Порог: {s['discount_pct']}% + {_fmt(s['min_price_diff'])} руб.\n"
-        f"🌐 Дашборд: http://localhost:{WEB_PORT}"
+        f"🌐 Дашборд: {WEB_APP_URL}"
     )
     markup = kb([("⬅️ Назад", "main")])
     if msg_id: tg_edit(chat_id, msg_id, txt, markup)
@@ -1193,6 +1293,231 @@ def _send_watchlist(chat_id, msg_id):
         rows.append([(f"📦 {nm}", f"cust:{iid}")])
     rows.append([("⬅️ Назад","main")])
     tg_edit(chat_id, msg_id, "📋 <b>Мой список:</b>", kb(*rows))
+
+# ── Мои товары ────────────────────────────────────────────────
+
+def _send_my_items(chat_id, msg_id):
+    if not _is_vip_or_owner(chat_id):
+        tg_edit(chat_id, msg_id, "⛔ Доступно только для VIP.", kb([("⬅️","main")])); return
+
+    inv = db.inv_list(chat_id)
+    if not inv:
+        tg_edit(chat_id, msg_id,
+                "🛒 <b>Мои товары</b>\n\nСписок пуст.",
+                kb([("⬅️ Назад","main")])); return
+
+    lines = ["🛒 <b>Мои товары</b>\n"]
+    rows  = []
+    for inv_key, item in inv.items():
+        cheaper = db.inv_count_cheaper(item["item_id"], item["sell_price"])
+        status  = f"✅" if cheaper == 0 else f"❗{cheaper}"
+        lines.append(
+            f"{status} <b>{item['name']}</b>\n"
+            f"   {item['amount']} шт. | продажа: {_fmt(item['sell_price'])} руб."
+        )
+        # Кнопка удаления (item_id + цены кодируем через разделитель)
+        iid = item["item_id"]
+        bp  = int(item["buy_price"])
+        sp  = int(item["sell_price"])
+        rows.append([(f"❌ {item['name'][:20]}", f"inv_rm:{iid}:{bp}:{sp}")])
+    rows.append([("🔄 Обновить", "my_items"), ("⬅️ Назад", "main")])
+    tg_edit(chat_id, msg_id, "\n".join(lines), kb(*rows))
+
+
+# ── Мой кабинет ───────────────────────────────────────────────
+
+def _send_my_cabinet(chat_id, msg_id):
+    if not _is_vip_or_owner(chat_id):
+        tg_edit(chat_id, msg_id, "⛔ Доступно только для VIP.", kb([("⬅️","main")])); return
+
+    inv = db.inv_list(chat_id)
+
+    # Деньги в обороте — сумма по цене покупки
+    money_in  = sum(i["buy_price"]  * i["amount"] for i in inv.values())
+    # Ожидаемый баланс — сумма по цене продажи × 0.968
+    money_out = sum(i["sell_price"] * i["amount"] * 0.968 for i in inv.values())
+    # ROI
+    roi_day   = db.roi(chat_id, 1)
+    roi_week  = db.roi(chat_id, 7)
+    roi_month = db.roi(chat_id, 30)
+
+    txt = (
+        f"🏦 <b>Мой кабинет</b>\n\n"
+        f"💼 Активных позиций: <b>{len(inv)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Деньги в обороте</b>\n"
+        f"   {_fmt(money_in)} руб. (по цене покупки)\n\n"
+        f"📈 <b>Ожидаемый баланс</b>\n"
+        f"   {_fmt(money_out)} руб. (×96.8% комиссия)\n\n"
+        f"📊 <b>Прибыль (ROI)</b>\n"
+        f"   День:    {_fmt_profit(roi_day)}\n"
+        f"   Неделя:  {_fmt_profit(roi_week)}\n"
+        f"   Месяц:   {_fmt_profit(roi_month)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>ROI учитывает комиссию 3.2% (96.8%)</i>"
+    )
+    markup = kb(
+        [("🛒 Мои товары",       "my_items"),
+         ("📊 По предметам",     "item_stats")],
+        [("📜 История продаж",   "sales_hist")],
+        [("⬅️ Назад",            "main")],
+    )
+    tg_edit(chat_id, msg_id, txt, markup)
+
+
+def _fmt_profit(v: float) -> str:
+    sign = "+" if v >= 0 else ""
+    return f"<b>{sign}{_fmt(v)}</b> руб."
+
+
+_HIST_PAGE = 8   # продаж на страницу
+
+
+def _send_sales_history(chat_id, msg_id, page: int = 0):
+    """Последние продажи с пагинацией."""
+    if not _is_vip_or_owner(chat_id):
+        tg_edit(chat_id, msg_id, "⛔ Доступно только для VIP.", kb([("⬅️","main")])); return
+
+    sold = [e for e in reversed(db.my_sold) if e.get("chat_id") == str(chat_id)]
+    total = len(sold)
+    if not sold:
+        tg_edit(chat_id, msg_id,
+                "📜 <b>История продаж</b>\n\nПродаж пока нет.",
+                kb([("⬅️ Кабинет", "my_cabinet")])); return
+
+    start      = page * _HIST_PAGE
+    page_items = sold[start:start + _HIST_PAGE]
+
+    lines = [f"📜 <b>История продаж</b>  ({total} всего)\n"]
+    for e in page_items:
+        profit = e.get("profit", 0)
+        sign   = "+" if profit >= 0 else ""
+        dt     = (e.get("sold_at") or "")[:10]
+        lines.append(
+            f"<b>{e['name']}</b> — {e['amount']} шт.\n"
+            f"  💰 {_fmt(e['sell_price'])} руб. | {sign}{_fmt(profit)} руб. | {dt}"
+        )
+
+    nav = []
+    if page > 0:
+        nav.append(("◀️ Назад", f"hist_page:{page-1}"))
+    if start + _HIST_PAGE < total:
+        nav.append(("▶️ Вперёд", f"hist_page:{page+1}"))
+    rows = [nav] if nav else []
+    rows.append([("⬅️ Кабинет", "my_cabinet")])
+    tg_edit(chat_id, msg_id, "\n".join(lines), kb(*rows))
+
+
+def _send_item_stats(chat_id, msg_id):
+    """ROI по каждому предмету — видно что выгоднее торговать."""
+    if not _is_vip_or_owner(chat_id):
+        tg_edit(chat_id, msg_id, "⛔ Доступно только для VIP.", kb([("⬅️","main")])); return
+
+    sold = [e for e in db.my_sold if e.get("chat_id") == str(chat_id)]
+    if not sold:
+        tg_edit(chat_id, msg_id,
+                "📊 <b>Статистика по предметам</b>\n\nДанных нет.",
+                kb([("⬅️ Кабинет", "my_cabinet")])); return
+
+    by_item: dict = {}
+    for e in sold:
+        iid = e["item_id"]
+        d   = by_item.setdefault(iid, {
+            "name": e["name"], "qty": 0, "profit": 0.0, "turnover": 0.0
+        })
+        d["qty"]      += e["amount"]
+        d["profit"]   += e.get("profit", 0.0)
+        d["turnover"] += e["buy_price"] * e["amount"]
+
+    items = sorted(by_item.values(), key=lambda x: -x["profit"])
+
+    lines = ["📊 <b>Статистика по предметам</b>\n"]
+    for d in items[:15]:
+        avg_pp = d["profit"] / max(d["qty"], 1)
+        sign   = "+" if d["profit"] >= 0 else ""
+        lines.append(
+            f"<b>{d['name']}</b>\n"
+            f"  Продано: {d['qty']} шт. | Ср. прибыль/шт.: {sign}{_fmt(avg_pp)} руб.\n"
+            f"  Итого: {sign}{_fmt(d['profit'])} руб. | Оборот: {_fmt(d['turnover'])} руб."
+        )
+
+    tg_edit(chat_id, msg_id, "\n".join(lines), kb([("⬅️ Кабинет", "my_cabinet")]))
+
+
+# ── Оповещение о продаже инвентаря ────────────────────────────
+
+def _notify_inv_sale(chat_id: str, entry: dict):
+    """Отправить уведомление о продаже ТОЛЬКО владельцу позиции."""
+    profit = entry.get("profit", 0)
+    sign   = "+" if profit >= 0 else ""
+    txt = (
+        f"🎉 <b>Продажа!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 <b>{entry['name']}</b>\n"
+        f"💰 Продано за:  <b>{_fmt(entry['sell_price'])}</b> руб.\n"
+        f"🛒 Куплено за:  <b>{_fmt(entry['buy_price'])}</b> руб.\n"
+        f"📦 Количество:  <b>{entry['amount']}</b> шт.\n"
+        f"💵 Прибыль:     <b>{sign}{_fmt(profit)}</b> руб.\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+    )
+    tg_send(txt, chat_id, kb([("🏦 Мой кабинет", "my_cabinet")]))
+
+
+def check_competitor_undercut(item_id: str):
+    """
+    Проверяет для каждого VIP/владельца: появился ли на рынке лот дешевле
+    их цены продажи. Алертит не чаще чем раз в COMP_ALERT_COOLDOWN секунд.
+    """
+    to_check = {str(TELEGRAM_CHAT_ID)} | db.vip_users
+    now = time.time()
+    for chat_id in to_check:
+        user_inv = db.inv_list(chat_id)
+        for inv_key, item in user_inv.items():
+            if item["item_id"] != item_id:
+                continue
+            cheaper = db.inv_count_cheaper(item_id, item["sell_price"])
+            if cheaper == 0:
+                continue
+            last = _comp_alerted.get(chat_id, {}).get(item_id, 0)
+            if now - last < COMP_ALERT_COOLDOWN:
+                continue
+            _comp_alerted.setdefault(chat_id, {})[item_id] = now
+            txt = (
+                f"⚠️ <b>Конкурент снизил цену!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 <b>{item['name']}</b>\n"
+                f"💰 Твоя цена:       <b>{_fmt(item['sell_price'])}</b> руб.\n"
+                f"❗ Лотов дешевле:  <b>{cheaper}</b> шт.\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+            )
+            tg_send(txt, chat_id, kb([("🛒 Мои товары", "my_items")]))
+
+
+def check_inventory_sales(item_id: str, sold_lots: list):
+    """
+    После detect_buyouts проверяем: совпадает ли цена проданного лота
+    с ценой продажи любой позиции в инвентаре пользователя.
+    Допуск ±5% — учёт округлений и мелких отклонений.
+    """
+    if not sold_lots:
+        return
+    to_check = {str(TELEGRAM_CHAT_ID)} | db.vip_users
+    for chat_id in to_check:
+        user_inv = db.inv_list(chat_id)
+        for inv_key, item in user_inv.items():
+            if item["item_id"] != item_id:
+                continue
+            sp = item["sell_price"]
+            for sold in sold_lots:
+                unit = sold.get("unit_price", 0)
+                if sp > 0 and abs(unit - sp) / sp < 0.05:
+                    entry = db.inv_sold_one(chat_id, inv_key)
+                    if entry:
+                        _notify_inv_sale(chat_id, entry)
+                    break  # по одной за цикл
+
 
 # ── Поиск ──────────────────────────────────────────────────────
 
@@ -1224,11 +1549,136 @@ def _send_r(chat_id, msg_id, txt, markup):
 
 # ── Обработка входящих ────────────────────────────────────────
 
+def _parse_price(text: str) -> Optional[float]:
+    """Парсит число из текста, убирая пробелы и запятые."""
+    try:
+        return float(text.replace(",", ".").replace(" ", "").replace("\u202f", ""))
+    except Exception:
+        return None
+
+
+def _sell_price_hint(item_id: str, lot_key: str) -> str:
+    """
+    Подсказка с ориентиром рынка и рекомендуемой ценой продажи.
+    Ищет лот в active_lots, чтобы получить качество/заточку.
+    """
+    snap = db.active_lots.get(f"{item_id}:{lot_key}")
+    is_art = item_id in art_db
+    if snap and is_art:
+        qlt = snap.get("qlt", 0)
+        pg  = snap.get("ptn_grp", "0")
+        res = db.avg_price(item_id, qlt, pg)
+    elif is_art:
+        res = db.avg_price(item_id, 0, "0")
+    else:
+        res = db.avg_price_custom(item_id)
+    if not res:
+        return ""
+    avg_p, n = res
+    rec_p = avg_p * 0.99   # на 1% ниже среднего — быстрее продашь
+    return (
+        f"\n📊 Ориентир рынка: <b>{_fmt(avg_p)}</b> руб. ({n} прод.)\n"
+        f"💡 Рекомендуем:   <b>{_fmt(rec_p)}</b> руб. (−1% от среднего)"
+    )
+
+
 def _handle_text(chat_id, text):
     state = _state(chat_id)
     _set(chat_id, "")
 
-    if state == "search_art":
+    # ── Одиночная покупка: ожидаем цену покупки ───────────────
+    if state.startswith("inv_bp:"):
+        parts = state.split(":", 2)
+        if len(parts) == 3:
+            _, b_item, b_lk = parts
+            price = _parse_price(text)
+            if price is None or price <= 0:
+                _set(chat_id, state)
+                tg_send("❌ Неверный формат. Введи число:", chat_id, kb([("❌ Отмена","main")])); return
+            _set(chat_id, f"inv_sp:{b_item}:{b_lk}:1:{int(price)}")
+            tg_send(
+                f"💰 Цена покупки: <b>{_fmt(price)}</b> руб.\n\n"
+                f"Введи <b>цену продажи</b> (руб./шт.):\n"
+                f"{_sell_price_hint(b_item, b_lk)}",
+                chat_id, kb([("❌ Отмена","main")]))
+        return
+
+    # ── Одиночная покупка: ожидаем цену продажи ───────────────
+    elif state.startswith("inv_sp:"):
+        parts = state.split(":")
+        if len(parts) == 5:
+            _, b_item, b_lk, amt_s, bp_s = parts
+            price = _parse_price(text)
+            if price is None or price <= 0:
+                _set(chat_id, state)
+                tg_send("❌ Неверный формат. Введи число:", chat_id, kb([("❌ Отмена","main")])); return
+            amt    = int(amt_s)
+            bp     = float(bp_s)
+            iname  = item_name(b_item)
+            db.inv_add(chat_id, b_item, iname, bp, price, amt)
+            db.exclude_lot(b_lk)
+            profit_est = (price * 0.968 - bp) * amt
+            sign = "+" if profit_est >= 0 else ""
+            tg_send(
+                f"✅ Добавлено в инвентарь!\n"
+                f"📦 <b>{iname}</b>\n"
+                f"   {amt} шт. | покупка {_fmt(bp)} → продажа {_fmt(price)} руб.\n"
+                f"   Ожидаемая прибыль: <b>{sign}{_fmt(profit_est)}</b> руб.",
+                chat_id,
+                kb([("🛒 Мои товары","my_items"), ("⬅️ Главное меню","main")]))
+        return
+
+    # ── Множественная покупка: ожидаем цену покупки ───────────
+    elif state.startswith("inv_multi_bp:"):
+        parts = state.split(":", 2)
+        if len(parts) == 3:
+            _, b_item, b_lk = parts
+            tokens = text.strip().split()
+            price  = _parse_price(tokens[0]) if tokens else None
+            amount = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 1
+            if price is None or price <= 0:
+                _set(chat_id, state)
+                tg_send("❌ Неверный формат. Пример: <code>150000 2</code>",
+                        chat_id, kb([("✅ Готово","inv_done"),("❌ Отмена","inv_cancel")])); return
+            session = _inv_pending.setdefault(chat_id, {"item_id":b_item,"lk":b_lk,"entries":[]})
+            session["_cur_bp"]  = price
+            session["_cur_amt"] = amount
+            _set(chat_id, f"inv_multi_sp:{b_item}:{b_lk}:{amount}:{int(price)}")
+            tg_send(
+                f"💰 Куплено: <b>{amount} шт.</b> по <b>{_fmt(price)}</b> руб.\n\n"
+                f"Введи <b>цену продажи</b> (руб./шт.):\n"
+                f"{_sell_price_hint(b_item, b_lk)}",
+                chat_id, kb([("✅ Готово","inv_done"),("❌ Отмена","inv_cancel")]))
+        return
+
+    # ── Множественная покупка: ожидаем цену продажи ───────────
+    elif state.startswith("inv_multi_sp:"):
+        parts = state.split(":")
+        if len(parts) == 5:
+            _, b_item, b_lk, amt_s, bp_s = parts
+            price = _parse_price(text)
+            if price is None or price <= 0:
+                _set(chat_id, state)
+                tg_send("❌ Неверный формат. Введи число:",
+                        chat_id, kb([("✅ Готово","inv_done"),("❌ Отмена","inv_cancel")])); return
+            amt = int(amt_s)
+            bp  = float(bp_s)
+            session = _inv_pending.setdefault(chat_id, {"item_id":b_item,"lk":b_lk,"entries":[]})
+            session["entries"].append({"buy_price":bp,"sell_price":price,"amount":amt})
+            total = sum(e["amount"] for e in session["entries"])
+            profit_est = (price * 0.968 - bp) * amt
+            sign = "+" if profit_est >= 0 else ""
+            _set(chat_id, f"inv_multi_bp:{b_item}:{b_lk}")
+            tg_send(
+                f"✅ Партия добавлена: <b>{amt} шт.</b> × {_fmt(bp)} → {_fmt(price)} руб.\n"
+                f"   Прибыль: <b>{sign}{_fmt(profit_est)}</b> руб.\n\n"
+                f"📦 В сессии: <b>{total} шт.</b>\n"
+                f"Добавить ещё или нажми <b>Готово</b>:",
+                chat_id,
+                kb([("➕ Ещё","inv_add_more"),("✅ Готово","inv_done"),("❌ Отмена","inv_cancel")]))
+        return
+
+    elif state == "search_art":
         _handle_search_art(chat_id, text)
     elif state == "search_item":
         _handle_search_item(chat_id, text)
@@ -1270,18 +1720,88 @@ def _handle_text(chat_id, text):
 
 def _handle_callback(chat_id, msg_id, data):
     if data == "main":            _send_main(chat_id, msg_id)
+    elif data == "my_items":
+        _send_my_items(chat_id, msg_id)
+    elif data == "my_cabinet":
+        _send_my_cabinet(chat_id, msg_id)
+    elif data == "sales_hist":
+        _send_sales_history(chat_id, msg_id, 0)
+    elif data.startswith("hist_page:"):
+        try: page = int(data.split(":")[1])
+        except Exception: page = 0
+        _send_sales_history(chat_id, msg_id, page)
+    elif data == "item_stats":
+        _send_item_stats(chat_id, msg_id)
+    elif data.startswith("inv_rm:"):
+        # inv_rm:item_id:bp:sp
+        if not _is_vip_or_owner(chat_id):
+            return
+        parts = data.split(":")
+        if len(parts) == 4:
+            _, iid, bp, sp = parts
+            inv_key = f"{iid}:{bp}:{sp}"
+            db.inv_del(chat_id, inv_key)
+        _send_my_items(chat_id, msg_id)
     elif data.startswith("bought:"):
-        # Кнопка "Купил" из алерта
+        # Кнопка "Купил (1 шт.)" из алерта — запрашиваем цену покупки
         parts = data.split(":", 2)
         if len(parts) == 3:
             _, b_item, b_lk = parts
-            if _is_owner(chat_id):
-                db.exclude_lot(b_lk)
-                tg_edit(chat_id, msg_id,
-                        "✅ Лот убран из истории цен.\n<i>Он больше не влияет на расчёт ориентира.</i>",
-                        kb([("⬅️ Назад", f"art:{b_item}")]))
-            else:
-                tg_answer_text(msg_id, "Только владелец может помечать покупки.")
+            if not _is_vip_or_owner(chat_id):
+                tg_answer_text(msg_id, "Только VIP/владелец может добавлять в инвентарь.")
+                return
+            _set(chat_id, f"inv_bp:{b_item}:{b_lk}")
+            tg_edit(chat_id, msg_id,
+                    f"🛒 <b>Купил (1 шт.)</b>\n\nВведи <b>цену покупки</b> (руб./шт.):",
+                    kb([("❌ Отмена", "main")]))
+    elif data.startswith("bought_multi:"):
+        # Кнопка "Купил несколько" из алерта
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            _, b_item, b_lk = parts
+            if not _is_vip_or_owner(chat_id):
+                tg_answer_text(msg_id, "Только VIP/владелец может добавлять в инвентарь.")
+                return
+            _inv_pending[chat_id] = {"item_id": b_item, "lk": b_lk, "entries": [], "msg_id": msg_id}
+            _set(chat_id, f"inv_multi_bp:{b_item}:{b_lk}")
+            tg_edit(chat_id, msg_id,
+                    f"🛒 <b>Купил несколько</b>\n\n"
+                    f"Введи <b>цену покупки</b> и кол-во через пробел\n"
+                    f"<i>Пример: 150000 3  или просто 150000</i>",
+                    kb([("✅ Готово", "inv_done"), ("❌ Отмена", "inv_cancel")]))
+    elif data == "inv_done":
+        # Завершить сессию многоступенчатой покупки
+        _set(chat_id, "")
+        session = _inv_pending.pop(chat_id, None)
+        if not session or not session.get("entries"):
+            tg_edit(chat_id, msg_id, "ℹ️ Ничего не добавлено.", kb([("⬅️","main")])); return
+        for e in session["entries"]:
+            iname = item_name(session["item_id"])
+            db.inv_add(chat_id, session["item_id"], iname,
+                       e["buy_price"], e["sell_price"], e["amount"])
+        db.exclude_lot(session["lk"])
+        total = sum(e["amount"] for e in session["entries"])
+        tg_edit(chat_id, msg_id,
+                f"✅ Добавлено <b>{total} шт.</b> в инвентарь!\n"
+                f"<i>Лот убран из истории цен.</i>",
+                kb([("🛒 Мои товары", "my_items"), ("⬅️ Главное меню", "main")]))
+    elif data == "inv_cancel":
+        _set(chat_id, "")
+        _inv_pending.pop(chat_id, None)
+        _send_main(chat_id, msg_id)
+    elif data == "inv_add_more":
+        # Добавить ещё в текущую сессию
+        session = _inv_pending.get(chat_id)
+        if not session:
+            _send_main(chat_id, msg_id); return
+        b_item = session["item_id"]
+        b_lk   = session["lk"]
+        _set(chat_id, f"inv_multi_bp:{b_item}:{b_lk}")
+        tg_edit(chat_id, msg_id,
+                f"🛒 <b>Следующая покупка</b>\n\n"
+                f"Введи <b>цену покупки</b> и кол-во через пробел\n"
+                f"<i>Пример: 150000 3  или просто 150000</i>",
+                kb([("✅ Готово", "inv_done"), ("❌ Отмена", "inv_cancel")]))
     elif data == "status":        _send_status(chat_id, msg_id)
     elif data == "watchlist":     _send_watchlist(chat_id, msg_id)
     elif data == "settings":
@@ -1757,6 +2277,12 @@ def process_item(item_id: str, is_art: bool):
         if _cycle_buyouts >= MAX_BUYOUTS_PER_CYCLE:
             log.warning(f"Предохранитель: {_cycle_buyouts} выкупов за цикл — подозрительно, "
                         f"остановка detect_buyouts до следующего цикла")
+        # Проверяем продажи инвентаря пользователей
+        if bought:
+            check_inventory_sales(item_id, bought)
+
+    # Проверяем конкурентов для инвентаря (после обновления active_lots)
+    check_competitor_undercut(item_id)
 
     for lot in lots:
         qlt, ptn = extract_qlt_ptn(lot, item_id) if is_art else (0, None)
@@ -1855,6 +2381,37 @@ class WebH(BaseHTTPRequestHandler):
             }, ensure_ascii=False, default=str).encode("utf-8")
             self._ok("application/json; charset=utf-8", body,
                      [("Access-Control-Allow-Origin","*")])
+        elif self.path == "/api/cabinet":
+            # Данные кабинета владельца (только для локального дашборда)
+            owner = str(TELEGRAM_CHAT_ID)
+            inv   = db.inv_list(owner)
+            sold  = [e for e in db.my_sold if e.get("chat_id") == owner]
+
+            # Группировка по предмету
+            by_item: dict = {}
+            for e in sold:
+                iid = e["item_id"]
+                d   = by_item.setdefault(iid, {
+                    "name": e["name"], "qty": 0, "profit": 0.0, "turnover": 0.0
+                })
+                d["qty"]      += e["amount"]
+                d["profit"]   += e.get("profit", 0.0)
+                d["turnover"] += e["buy_price"] * e["amount"]
+
+            money_in  = sum(i["buy_price"]  * i["amount"] for i in inv.values())
+            money_out = sum(i["sell_price"] * i["amount"] * 0.968 for i in inv.values())
+            body = json.dumps({
+                "inventory":    list(inv.values()),
+                "sold":         sold[-500:],
+                "item_stats":   list(by_item.values()),
+                "money_in":     money_in,
+                "money_out":    money_out,
+                "roi_day":      db.roi(owner, 1),
+                "roi_week":     db.roi(owner, 7),
+                "roi_month":    db.roi(owner, 30),
+            }, ensure_ascii=False, default=str).encode("utf-8")
+            self._ok("application/json; charset=utf-8", body,
+                     [("Access-Control-Allow-Origin","*")])
         elif self.path.startswith("/api/chart/custom/"):
             iid = self.path.split("/")[-1]
             png = make_chart_custom(iid)
@@ -1914,7 +2471,7 @@ if __name__ == "__main__":
     threading.Thread(target=start_web,            daemon=True).start()
     threading.Thread(target=tg_polling_loop,      daemon=True).start()
     threading.Thread(target=_flush_pending_alerts, daemon=True).start()
-    log.info(f"Дашборд: http://localhost:{WEB_PORT}")
+    log.info(f"Дашборд: {WEB_APP_URL}")
 
     try:
         monitor_loop()
