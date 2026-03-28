@@ -227,79 +227,123 @@ function renderArtDetail(id){
 
 // ── CHART ──────────────────────────────────────────────────────────────
 function drawArtChart(byQ){
-  const traces=[];
-
+  // Собираем активные качества
+  const activeQ = [];
   for(let q=0;q<=5;q++){
-    if(!byQ[q].length||hidQ.has(q))continue;
-    const qColor=QC[q]||'#94a3b8';
+    if(byQ[q]&&byQ[q].length&&!hidQ.has(q)) activeQ.push(q);
+  }
+  if(!activeQ.length){
+    document.getElementById('art-plotly').innerHTML=
+      '<div class="empty"><span class="empty-icon">📊</span>Нет данных</div>';
+    return;
+  }
 
-    // ── Group by INDIVIDUAL ptn level (0..15) ─────────────────────────
-    // Each ptn level gets its own scatter series
-    // Color = quality color, opacity/size encodes exact ptn level
-    // Legend grouped by quality → ptn_group → ptn_level
-    const byPtn={};
+  // Plotly subplots: один row на каждое качество
+  const nRows = activeQ.length;
+  const ROW_H = 0.85 / nRows;  // доля высоты на каждый subplot
+  const GAP   = 0.06;
+
+  const traces = [];
+  const layout = {
+    paper_bgcolor: BG_PAPER,
+    plot_bgcolor:  BG_PLOT,
+    font:  {color:'#e5e7eb', family:'Inter,sans-serif', size:11},
+    margin:{t:24, r:200, b:50, l:90},
+    hovermode:'closest',
+    dragmode:'zoom',
+    hoverlabel:{bgcolor:'#111827', bordercolor:'#3b82f6', font:{color:'#f9fafb',size:12}},
+    showlegend: true,
+    legend:{
+      bgcolor:'rgba(13,19,33,0.92)', bordercolor:BG_GRID,
+      font:{size:10, color:'#e5e7eb'},
+      x:1.01, xanchor:'left', y:1, yanchor:'top',
+      tracegroupgap:10,
+      groupclick:'toggleitem',
+    },
+  };
+
+  // Создаём оси: xaxis, yaxis для первого, xaxis2/yaxis2 для второго и т.д.
+  activeQ.forEach((q, idx)=>{
+    const axN  = idx===0 ? '' : String(idx+1);
+    const yBot = 1 - (idx+1)*ROW_H - idx*GAP/nRows;
+    const yTop = 1 - idx*ROW_H - idx*GAP/nRows;
+    const domain = [Math.max(0, yBot), Math.min(1, yTop)];
+    const qColor = QC[q]||'#94a3b8';
+
+    layout[`xaxis${axN}`] = {
+      gridcolor:BG_GRID, zerolinecolor:BG_GRID,
+      tickfont:{size:9, color:'#6b7280'},
+      type:'date',
+      anchor:`y${axN}`,
+      // rangeslider только для последнего (нижнего) subplot
+      rangeslider: idx===nRows-1
+        ? {visible:true, bgcolor:'#0d1321', bordercolor:BG_GRID, thickness:0.05}
+        : {visible:false},
+      matches: idx===0 ? undefined : 'x',  // синхронизируем X оси
+    };
+    layout[`yaxis${axN}`] = {
+      domain,
+      gridcolor:BG_GRID, zerolinecolor:BG_GRID,
+      tickfont:{size:9, color:'#6b7280'},
+      tickformat:',.0f', exponentformat:'none',
+      title:{text: QN[q]||String(q), font:{color:qColor, size:10}, standoff:4},
+      anchor:`x${axN}`,
+    };
+
+    // Группируем продажи по индивидуальному уровню заточки
+    const byPtn = {};
     byQ[q].forEach(s=>{
-      const ptn=s.ptn===null||s.ptn===undefined?0:s.ptn;
+      const ptn = (s.ptn===null||s.ptn===undefined) ? 0 : s.ptn;
       (byPtn[ptn]=byPtn[ptn]||[]).push(s);
     });
 
-    // Sort ptn levels
-    const ptnLevels=Object.keys(byPtn).map(Number).sort((a,b)=>a-b);
-
-    // Track which groups we've already added a legend entry for (for grouping)
-    const groupLegendSeen={};
+    const ptnLevels = Object.keys(byPtn).map(Number).sort((a,b)=>a-b);
+    const grpLegendSeen = {};
 
     ptnLevels.forEach(ptn=>{
-      const pts=[...byPtn[ptn]].sort((a,b)=>a.sold_at<b.sold_at?-1:1);
-      const xs=pts.map(s=>s.sold_at);
-      const ys=pts.map(s=>s.unit_price);
-      const grp=ptnToGroup(ptn);
-      const op=ptnOpacity(ptn);
-      const sz=ptnSize(ptn);
-      const med=calcMed(ys);
-
-      // Legend label: "Особый · +7" — specific level
-      const ptnLabel=ptn===0?'без заточки':`+${ptn}`;
-      // Legend group key: quality + ptn_group
-      const lgGrp=`q${q}_${grp}`;
-      // First trace in this (quality, group) = show group title in legend
-      const isFirstInGrp=!groupLegendSeen[lgGrp];
-      groupLegendSeen[lgGrp]=true;
+      const pts = [...byPtn[ptn]].sort((a,b)=>a.sold_at<b.sold_at?-1:1);
+      const xs  = pts.map(s=>s.sold_at);
+      const ys  = pts.map(s=>s.unit_price);
+      const grp = ptnToGroup(ptn);
+      const lgGrp = `q${q}_${grp}`;
+      const isFirst = !grpLegendSeen[lgGrp];
+      grpLegendSeen[lgGrp] = true;
+      const med = calcMed(ys);
+      const sz  = ptnSize(ptn);
+      const op  = ptnOpacity(ptn);
+      const ptnLabel = ptn===0 ? 'без заточки' : `+${ptn}`;
 
       traces.push({
         x:xs, y:ys,
-        mode:'markers',
-        type:'scatter',
+        mode:'markers', type:'scatter',
         name: ptnLabel,
-        // legendgrouptitle shows the group header (e.g. "Особый · ⚡+5-9")
-        legendgrouptitle: isFirstInGrp
-          ? {text:`<b>${QN[q]||q}</b> · ${PGL[grp]}`,font:{color:qColor,size:10}}
+        legendgrouptitle: isFirst
+          ? {text:`<b style="color:${qColor}">${QN[q]}</b> · ${PGL[grp]}`,
+             font:{color:qColor, size:10}}
           : undefined,
         legendgroup: lgGrp,
+        xaxis:`x${axN}`, yaxis:`y${axN}`,
         marker:{
-          color:qColor,
-          size:sz,
-          opacity:op,
-          line:{color:'rgba(0,0,0,0.3)',width:0.8},
+          color:qColor, size:sz, opacity:op,
+          line:{color:'rgba(0,0,0,0.3)', width:0.8},
         },
         text:pts.map(s=>{
-          const pv=s.ptn===null||s.ptn===undefined?0:s.ptn;
+          const pv=(s.ptn===null||s.ptn===undefined)?0:s.ptn;
           const d=med>0?((s.unit_price-med)/med*100).toFixed(1):0;
           const v=s.unit_price<med*0.8?'🔥 Очень выгодно':
                   s.unit_price>med*1.3?'⚠️ Завышено':'✅ Норма';
-          return `<b>${QN[q]||q}</b> · заточка <b>+${pv}</b><br>`+
+          return `<b>${QN[q]}</b> · <b>+${pv}</b><br>`+
                  `Цена: <b>${fmt(s.unit_price)}</b> ₽<br>`+
                  `Медиана группы: ${fmt(med)} ₽<br>`+
-                 `Отклонение: ${d>0?'+':''}${d}%<br>${v}`;
+                 `Откл: ${d>0?'+':''}${d}%<br>${v}`;
         }),
         hovertemplate:'%{text}<extra></extra>',
-        showlegend:true,
       });
 
-      // Trend line for individual ptn level (>=4 points)
+      // Trend line (>=4 points)
       if(pts.length>=4){
-        const xn=pts.map(s=>new Date(s.sold_at).getTime()),x0=xn[0];
-        const lr=linReg(xn.map(x=>(x-x0)/3.6e6),ys);
+        const xn=pts.map(s=>new Date(s.sold_at).getTime()), x0=xn[0];
+        const lr=linReg(xn.map(x=>(x-x0)/3.6e6), ys);
         const txs=[],tys=[];
         for(let i=0;i<=60;i++){
           const t=x0+(xn[xn.length-1]-x0)*i/60;
@@ -307,74 +351,45 @@ function drawArtChart(byQ){
           tys.push(lr.s*(t-x0)/3.6e6+lr.b);
         }
         traces.push({
-          x:txs,y:tys,mode:'lines',type:'scatter',
-          showlegend:false,legendgroup:lgGrp,
-          line:{color:qColor,width:1.2,dash:'dot'},
-          opacity:op*0.35,hoverinfo:'skip',
+          x:txs, y:tys, mode:'lines', type:'scatter',
+          showlegend:false, legendgroup:lgGrp,
+          xaxis:`x${axN}`, yaxis:`y${axN}`,
+          line:{color:qColor, width:1.2, dash:'dot'},
+          opacity:op*0.35, hoverinfo:'skip',
         });
       }
 
-      // Group median line (one per ptn_group per quality, not per level)
-      // Only draw for the first ptn level in each group
-      if(isFirstInGrp){
-        // Collect all sales in this (qlt, ptn_group)
+      // Group median line — один раз на группу
+      if(isFirst){
         const allInGrp=[];
         ptnLevels.forEach(p=>{
           if(ptnToGroup(p)===grp) allInGrp.push(...byPtn[p].map(s=>s.unit_price));
         });
-        const grpMed=calcMed(allInGrp);
-        if(xs.length>=2){
-          const allXs=[...byQ[q]]
-            .filter(s=>ptnToGroup(s.ptn===null||s.ptn===undefined?0:s.ptn)===grp)
-            .map(s=>s.sold_at).sort();
-          if(allXs.length>=2){
-            traces.push({
-              x:[allXs[0],allXs[allXs.length-1]],
-              y:[grpMed,grpMed],
-              mode:'lines',type:'scatter',
-              showlegend:false,legendgroup:lgGrp,
-              line:{color:qColor,width:1.2,dash:'dashdot'},
-              opacity:0.38,hoverinfo:'skip',
-            });
-          }
+        const grpMed = calcMed(allInGrp);
+        const allXs  = byQ[q]
+          .filter(s=>ptnToGroup((s.ptn===null||s.ptn===undefined)?0:s.ptn)===grp)
+          .map(s=>s.sold_at).sort();
+        if(allXs.length>=2){
+          traces.push({
+            x:[allXs[0], allXs[allXs.length-1]],
+            y:[grpMed, grpMed],
+            mode:'lines', type:'scatter',
+            showlegend:false, legendgroup:lgGrp,
+            xaxis:`x${axN}`, yaxis:`y${axN}`,
+            line:{color:qColor, width:1.2, dash:'dashdot'},
+            opacity:0.38, hoverinfo:'skip',
+          });
         }
       }
     });
-  }
+  });
 
-  if(!traces.length){
-    document.getElementById('art-plotly').innerHTML=
-      '<div class="empty"><span class="empty-icon">📊</span>Продаж пока нет</div>';
-    return;
-  }
+  // Высота контейнера: 280px на качество, минимум 360px
+  const plotH = Math.max(360, activeQ.length * 280);
+  document.getElementById('art-plotly').style.height = plotH + 'px';
 
-  Plotly.react('art-plotly',traces,{
-    paper_bgcolor:BG_PAPER, plot_bgcolor:BG_PLOT,
-    font:{color:'#e5e7eb',family:'Inter,sans-serif',size:11},
-    margin:{t:16,r:220,b:60,l:90},
-    xaxis:{
-      gridcolor:BG_GRID,zerolinecolor:BG_GRID,
-      tickfont:{size:10,color:'#6b7280'},
-      type:'date',
-      rangeslider:{visible:true,bgcolor:'#0d1321',bordercolor:BG_GRID,thickness:0.07},
-    },
-    yaxis:{
-      gridcolor:BG_GRID,zerolinecolor:BG_GRID,
-      tickfont:{size:10,color:'#6b7280'},
-      tickformat:',.0f',exponentformat:'none',
-      title:{text:'руб./шт.',font:{color:'#4b5563',size:10}},
-    },
-    legend:{
-      bgcolor:'rgba(13,19,33,0.92)',bordercolor:BG_GRID,
-      font:{size:10,color:'#e5e7eb'},
-      x:1.01,xanchor:'left',y:1,yanchor:'top',
-      tracegroupgap:8,
-      groupclick:'toggleitem',
-    },
-    hovermode:'closest',dragmode:'zoom',
-    hoverlabel:{bgcolor:'#111827',bordercolor:'#3b82f6',font:{color:'#f9fafb',size:12}},
-  },{
-    responsive:true,scrollZoom:true,displaylogo:false,
+  Plotly.react('art-plotly', traces, layout, {
+    responsive:true, scrollZoom:true, displaylogo:false,
     modeBarButtonsToRemove:['lasso2d','select2d','toImage'],
   });
 }

@@ -1803,6 +1803,18 @@ def monitor_loop():
 
 _DASH = Path(__file__).parent / "dashboard.html"
 
+def _lot_is_fresh(lot: dict, max_age_sec: int = 300) -> bool:
+    """Лот актуален если был виден не позже чем 2 цикла назад (5 мин)."""
+    ls = lot.get("last_seen", "")
+    if not ls: return True
+    try:
+        dt = datetime.fromisoformat(ls.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return age <= max_age_sec
+    except Exception:
+        return True
+
+
 class WebH(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -1833,7 +1845,10 @@ class WebH(BaseHTTPRequestHandler):
                 "settings":     db.settings,
                 "arts":         arts,
                 "sales":        sales[-3000:],
-                "lots":         list(db.active_lots.values()),
+                "lots":         [
+                    v for v in db.active_lots.values()
+                    if _lot_is_fresh(v)
+                ],
                 "quality":      {str(k):{"name":v[0],"color":v[1]} for k,v in QUALITY.items()},
                 "ptn_groups":   PTN_LABELS,
                 "custom_items": custom_items_data,
