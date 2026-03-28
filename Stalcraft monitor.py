@@ -784,7 +784,7 @@ def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
 
     lines += [
         "",
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}",
+        f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC",
         "━━━━━━━━━━━━━━━━━━━━━",
     ]
     return "\n".join(lines)

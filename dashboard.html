@@ -227,169 +227,119 @@ function renderArtDetail(id){
 
 // ── CHART ──────────────────────────────────────────────────────────────
 function drawArtChart(byQ){
-  // Собираем активные качества
-  const activeQ = [];
-  for(let q=0;q<=5;q++){
-    if(byQ[q]&&byQ[q].length&&!hidQ.has(q)) activeQ.push(q);
-  }
-  if(!activeQ.length){
-    document.getElementById('art-plotly').innerHTML=
-      '<div class="empty"><span class="empty-icon">📊</span>Нет данных</div>';
-    return;
-  }
+  const activeQ=[];
+  for(let q=0;q<=5;q++){if(byQ[q]&&byQ[q].length&&!hidQ.has(q))activeQ.push(q);}
+  const el=document.getElementById('art-plotly');
+  if(!activeQ.length){el.innerHTML='<div class="empty"><span class="empty-icon">📊</span>Нет данных</div>';return;}
 
-  // Plotly subplots: один row на каждое качество
-  const nRows = activeQ.length;
-  const ROW_H = 0.85 / nRows;  // доля высоты на каждый subplot
-  const GAP   = 0.06;
+  const nR=activeQ.length;
+  // Height: 220px per quality, min 280
+  el.style.height=Math.max(280,nR*220)+'px';
 
-  const traces = [];
-  const layout = {
-    paper_bgcolor: BG_PAPER,
-    plot_bgcolor:  BG_PLOT,
-    font:  {color:'#e5e7eb', family:'Inter,sans-serif', size:11},
-    margin:{t:24, r:200, b:50, l:90},
-    hovermode:'closest',
-    dragmode:'zoom',
-    hoverlabel:{bgcolor:'#111827', bordercolor:'#3b82f6', font:{color:'#f9fafb',size:12}},
-    showlegend: true,
-    legend:{
-      bgcolor:'rgba(13,19,33,0.92)', bordercolor:BG_GRID,
-      font:{size:10, color:'#e5e7eb'},
-      x:1.01, xanchor:'left', y:1, yanchor:'top',
-      tracegroupgap:10,
-      groupclick:'toggleitem',
-    },
+  // Build subplots layout
+  const GAP=0.04;
+  const rowH=(1-(nR-1)*GAP)/nR;
+  const layout={
+    paper_bgcolor:BG_PAPER, plot_bgcolor:BG_PLOT,
+    font:{color:'#e5e7eb',family:'Inter,sans-serif',size:11},
+    margin:{t:16,r:210,b:40,l:80},
+    hovermode:'closest', dragmode:'zoom',
+    hoverlabel:{bgcolor:'#111827',bordercolor:'#3b82f6',font:{color:'#f9fafb',size:12}},
+    showlegend:true,
+    legend:{bgcolor:'rgba(10,15,26,0.95)',bordercolor:'#1e2a3a',
+      font:{size:10,color:'#e5e7eb'},x:1.01,xanchor:'left',y:1,yanchor:'top',
+      tracegroupgap:8,groupclick:'toggleitem'},
   };
 
-  // Создаём оси: xaxis, yaxis для первого, xaxis2/yaxis2 для второго и т.д.
-  activeQ.forEach((q, idx)=>{
-    const axN  = idx===0 ? '' : String(idx+1);
-    const yBot = 1 - (idx+1)*ROW_H - idx*GAP/nRows;
-    const yTop = 1 - idx*ROW_H - idx*GAP/nRows;
-    const domain = [Math.max(0, yBot), Math.min(1, yTop)];
-    const qColor = QC[q]||'#94a3b8';
-
-    layout[`xaxis${axN}`] = {
-      gridcolor:BG_GRID, zerolinecolor:BG_GRID,
-      tickfont:{size:9, color:'#6b7280'},
-      type:'date',
-      anchor:`y${axN}`,
-      // rangeslider только для последнего (нижнего) subplot
-      rangeslider: idx===nRows-1
-        ? {visible:true, bgcolor:'#0d1321', bordercolor:BG_GRID, thickness:0.05}
-        : {visible:false},
-      matches: idx===0 ? undefined : 'x',  // синхронизируем X оси
+  // One xaxis per row but all sharing same range (matches:'x')
+  activeQ.forEach((q,i)=>{
+    const n=i===0?'':String(i+1);
+    const yTop=1-i*(rowH+GAP);
+    const yBot=yTop-rowH;
+    // Use log scale if values span >10x
+    const vals=byQ[q].map(s=>s.unit_price).filter(v=>v>0);
+    const useLog=vals.length>1&&Math.max(...vals)/Math.min(...vals)>10;
+    layout['xaxis'+n]={
+      gridcolor:BG_GRID,zerolinecolor:BG_GRID,
+      tickfont:{size:9,color:'#6b7280'},type:'date',
+      showticklabels:true,
+      anchor:'y'+n,
+      matches:i===0?undefined:'x',
+      ...(i===nR-1?{rangeslider:{visible:true,bgcolor:'#0d1321',bordercolor:'#1e2a3a',thickness:0.06}}:{})
     };
-    layout[`yaxis${axN}`] = {
-      domain,
-      gridcolor:BG_GRID, zerolinecolor:BG_GRID,
-      tickfont:{size:9, color:'#6b7280'},
-      tickformat:',.0f', exponentformat:'none',
-      title:{text: QN[q]||String(q), font:{color:qColor, size:10}, standoff:4},
-      anchor:`x${axN}`,
+    layout['yaxis'+n]={
+      domain:[Math.max(0,yBot),Math.min(1,yTop)],
+      gridcolor:BG_GRID,zerolinecolor:BG_GRID,
+      tickfont:{size:9,color:'#6b7280'},
+      tickformat:',.0s',exponentformat:'SI',
+      type:useLog?'log':'linear',
+      anchor:'x'+n,
+      // Quality name as axis title
+      title:{text:'<b style="color:'+QC[q]+'">'+QN[q]+'</b>',
+             font:{color:QC[q],size:10},standoff:2},
     };
+  });
 
-    // Группируем продажи по индивидуальному уровню заточки
-    const byPtn = {};
-    byQ[q].forEach(s=>{
-      const ptn = (s.ptn===null||s.ptn===undefined) ? 0 : s.ptn;
-      (byPtn[ptn]=byPtn[ptn]||[]).push(s);
-    });
-
-    const ptnLevels = Object.keys(byPtn).map(Number).sort((a,b)=>a-b);
-    const grpLegendSeen = {};
+  const traces=[];
+  activeQ.forEach((q,i)=>{
+    const n=i===0?'':String(i+1);
+    const qColor=QC[q]||'#94a3b8';
+    // Group by individual ptn level
+    const byPtn={};
+    byQ[q].forEach(s=>{const p=(s.ptn===null||s.ptn===undefined)?0:s.ptn;(byPtn[p]=byPtn[p]||[]).push(s);});
+    const ptnLevels=Object.keys(byPtn).map(Number).sort((a,b)=>a-b);
+    const grpSeen={};
 
     ptnLevels.forEach(ptn=>{
-      const pts = [...byPtn[ptn]].sort((a,b)=>a.sold_at<b.sold_at?-1:1);
-      const xs  = pts.map(s=>s.sold_at);
-      const ys  = pts.map(s=>s.unit_price);
-      const grp = ptnToGroup(ptn);
-      const lgGrp = `q${q}_${grp}`;
-      const isFirst = !grpLegendSeen[lgGrp];
-      grpLegendSeen[lgGrp] = true;
-      const med = calcMed(ys);
-      const sz  = ptnSize(ptn);
-      const op  = ptnOpacity(ptn);
-      const ptnLabel = ptn===0 ? 'без заточки' : `+${ptn}`;
+      const pts=[...byPtn[ptn]].sort((a,b)=>a.sold_at<b.sold_at?-1:1);
+      const xs=pts.map(s=>s.sold_at);
+      const ys=pts.map(s=>s.unit_price);
+      const grp=ptnToGroup(ptn);
+      const lg='q'+q+'_'+grp;
+      const first=!grpSeen[lg]; grpSeen[lg]=true;
+      const med=calcMed(ys);
+      const sz=ptnSize(ptn), op=ptnOpacity(ptn);
+      const lbl=ptn===0?'без заточки':'+'+ptn;
 
       traces.push({
-        x:xs, y:ys,
-        mode:'markers', type:'scatter',
-        name: ptnLabel,
-        legendgrouptitle: isFirst
-          ? {text:`<b style="color:${qColor}">${QN[q]}</b> · ${PGL[grp]}`,
-             font:{color:qColor, size:10}}
-          : undefined,
-        legendgroup: lgGrp,
-        xaxis:`x${axN}`, yaxis:`y${axN}`,
-        marker:{
-          color:qColor, size:sz, opacity:op,
-          line:{color:'rgba(0,0,0,0.3)', width:0.8},
-        },
+        x:xs,y:ys,mode:'markers',type:'scatter',
+        name:lbl,legendgroup:lg,
+        legendgrouptitle:first?{text:'<b>'+QN[q]+'</b> · '+PGL[grp],font:{color:qColor,size:10}}:undefined,
+        xaxis:'x'+n,yaxis:'y'+n,
+        marker:{color:qColor,size:sz,opacity:op,line:{color:'rgba(0,0,0,0.25)',width:0.8}},
         text:pts.map(s=>{
           const pv=(s.ptn===null||s.ptn===undefined)?0:s.ptn;
           const d=med>0?((s.unit_price-med)/med*100).toFixed(1):0;
-          const v=s.unit_price<med*0.8?'🔥 Очень выгодно':
-                  s.unit_price>med*1.3?'⚠️ Завышено':'✅ Норма';
-          return `<b>${QN[q]}</b> · <b>+${pv}</b><br>`+
-                 `Цена: <b>${fmt(s.unit_price)}</b> ₽<br>`+
-                 `Медиана группы: ${fmt(med)} ₽<br>`+
-                 `Откл: ${d>0?'+':''}${d}%<br>${v}`;
+          const v=s.unit_price<med*0.8?'🔥 Очень выгодно':s.unit_price>med*1.3?'⚠️ Завышено':'✅ Норма';
+          return '<b>'+QN[q]+'</b> · +'+pv+'<br>Цена: <b>'+fmt(s.unit_price)+'</b> ₽<br>Медиана: '+fmt(med)+' ₽<br>Откл: '+(d>0?'+':'')+d+'%<br>'+v;
         }),
         hovertemplate:'%{text}<extra></extra>',
       });
 
-      // Trend line (>=4 points)
+      // Trend (>=4 pts)
       if(pts.length>=4){
-        const xn=pts.map(s=>new Date(s.sold_at).getTime()), x0=xn[0];
-        const lr=linReg(xn.map(x=>(x-x0)/3.6e6), ys);
+        const xn=pts.map(s=>new Date(s.sold_at).getTime()),x0=xn[0];
+        const lr=linReg(xn.map(x=>(x-x0)/3.6e6),ys);
         const txs=[],tys=[];
-        for(let i=0;i<=60;i++){
-          const t=x0+(xn[xn.length-1]-x0)*i/60;
-          txs.push(new Date(t).toISOString());
-          tys.push(lr.s*(t-x0)/3.6e6+lr.b);
-        }
-        traces.push({
-          x:txs, y:tys, mode:'lines', type:'scatter',
-          showlegend:false, legendgroup:lgGrp,
-          xaxis:`x${axN}`, yaxis:`y${axN}`,
-          line:{color:qColor, width:1.2, dash:'dot'},
-          opacity:op*0.35, hoverinfo:'skip',
-        });
+        for(let ii=0;ii<=80;ii++){const t=x0+(xn[xn.length-1]-x0)*ii/80;txs.push(new Date(t).toISOString());tys.push(lr.s*(t-x0)/3.6e6+lr.b);}
+        traces.push({x:txs,y:tys,mode:'lines',type:'scatter',showlegend:false,legendgroup:lg,
+          xaxis:'x'+n,yaxis:'y'+n,line:{color:qColor,width:1.5,dash:'dot'},opacity:op*0.4,hoverinfo:'skip'});
       }
 
-      // Group median line — один раз на группу
-      if(isFirst){
-        const allInGrp=[];
-        ptnLevels.forEach(p=>{
-          if(ptnToGroup(p)===grp) allInGrp.push(...byPtn[p].map(s=>s.unit_price));
-        });
-        const grpMed = calcMed(allInGrp);
-        const allXs  = byQ[q]
-          .filter(s=>ptnToGroup((s.ptn===null||s.ptn===undefined)?0:s.ptn)===grp)
-          .map(s=>s.sold_at).sort();
-        if(allXs.length>=2){
-          traces.push({
-            x:[allXs[0], allXs[allXs.length-1]],
-            y:[grpMed, grpMed],
-            mode:'lines', type:'scatter',
-            showlegend:false, legendgroup:lgGrp,
-            xaxis:`x${axN}`, yaxis:`y${axN}`,
-            line:{color:qColor, width:1.2, dash:'dashdot'},
-            opacity:0.38, hoverinfo:'skip',
-          });
-        }
+      // Group median line (once per group)
+      if(first){
+        const allG=[];ptnLevels.forEach(p=>{if(ptnToGroup(p)===grp)allG.push(...byPtn[p].map(s=>s.unit_price));});
+        const gMed=calcMed(allG);
+        const allX=byQ[q].filter(s=>ptnToGroup((s.ptn===null||s.ptn===undefined)?0:s.ptn)===grp).map(s=>s.sold_at).sort();
+        if(allX.length>=2)traces.push({x:[allX[0],allX[allX.length-1]],y:[gMed,gMed],
+          mode:'lines',type:'scatter',showlegend:false,legendgroup:lg,
+          xaxis:'x'+n,yaxis:'y'+n,line:{color:qColor,width:1,dash:'dashdot'},opacity:0.35,hoverinfo:'skip'});
       }
     });
   });
 
-  // Высота контейнера: 280px на качество, минимум 360px
-  const plotH = Math.max(360, activeQ.length * 280);
-  document.getElementById('art-plotly').style.height = plotH + 'px';
-
-  Plotly.react('art-plotly', traces, layout, {
-    responsive:true, scrollZoom:true, displaylogo:false,
+  Plotly.react('art-plotly',traces,layout,{
+    responsive:true,scrollZoom:true,displaylogo:false,
     modeBarButtonsToRemove:['lasso2d','select2d','toImage'],
   });
 }
