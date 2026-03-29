@@ -1063,8 +1063,55 @@ def _fmt(v) -> str:
         return f"{int(v):,}".replace(",", "\u202f")
     return str(v)
 
+
+def _compute_market_depth(item_id: str, qlt: int, pg: str, alert_unit: float) -> dict:
+    """Считает глубину рынка: сколько лотов по той же цене и ближайшие лоты выше."""
+    lots = db.lots_for(item_id)
+    eps = max(alert_unit * 0.0001, 1.0)
+
+    lot_data = []
+    for l in lots:
+        if l.get("qlt") != qlt or l.get("ptn_grp") != pg:
+            continue
+        if not l.get("buyout"):
+            continue
+        amt   = max(l.get("amount") or 1, 1)
+        uprice = float(l["buyout"]) / amt
+        lot_data.append({"price": uprice, "amount": amt})
+
+    prices_sorted = sorted(lot_data, key=lambda x: x["price"])
+
+    same_price = max(sum(1 for p in prices_sorted if abs(p["price"] - alert_unit) <= eps) - 1, 0)
+    above      = [p for p in prices_sorted if p["price"] > alert_unit + eps]
+
+    if not above:
+        return {
+            "same_price_count": same_price,
+            "next_price":       None,
+            "min_sell_price":   None,
+            "sell_profit":      None,
+            "sell_profit_pct":  None,
+            "nearby_lots":      [],
+        }
+
+    next_price   = above[0]["price"]
+    min_sell     = next_price - 1
+    profit       = min_sell * 0.968 - alert_unit
+    profit_pct   = profit / alert_unit * 100
+    nearby_lots  = above[:10]
+
+    return {
+        "same_price_count": same_price,
+        "next_price":       next_price,
+        "min_sell_price":   min_sell,
+        "sell_profit":      profit,
+        "sell_profit_pct":  profit_pct,
+        "nearby_lots":      nearby_lots,
+    }
+
+
 def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
-                 analysis: dict = None, ai: dict = None) -> str:
+                 analysis: dict = None, ai: dict = None, depth: dict = None) -> str:
     circle = QUALITY_CIRCLE.get(qlt, "")
     qname  = QUALITY.get(qlt, ("?",""))[0]
     name   = art_name(item_id) if is_art else item_name(item_id)
@@ -1117,6 +1164,24 @@ def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
                 f"точность {ai['accuracy']}%"
             )
 
+    # Глубина рынка
+    if depth:
+        lines.append("")
+        same = depth.get("same_price_count", 0)
+        nxt  = depth.get("next_price")
+        if same > 0:
+            lines.append(f"📦 По этой цене ещё: <b>{same} шт.</b>")
+        if nxt is not None:
+            msp  = depth["min_sell_price"]
+            pft  = depth["sell_profit"]
+            pct  = depth["sell_profit_pct"]
+            sign = "+" if pft >= 0 else ""
+            lines.append(f"📈 Ближайший выше: <b>{_fmt(nxt)}</b> руб.")
+            lines.append(f"💸 Мин. продажа:   <b>{_fmt(msp)}</b> руб.  "
+                         f"({sign}{_fmt(pft)} руб. / {sign}{pct:.1f}%)")
+        elif not same:
+            lines.append("📈 Дороже нет — единственный лот")
+
     lines += [
         "",
         f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC",
@@ -1125,11 +1190,11 @@ def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
     return "\n".join(lines)
 
 
-def _bought_markup(item_id: str, lk: str) -> dict:
+def _bought_markup(sess_id: int) -> dict:
     """Inline-кнопки 'Купил' и 'Купил несколько' под алертом."""
     return {"inline_keyboard": [[
-        {"text": "✅ Купил (1 шт.)",     "callback_data": f"bought:{item_id}:{lk}"},
-        {"text": "🛒 Купил несколько",   "callback_data": f"bought_multi:{item_id}:{lk}"},
+        {"text": "✅ Купил (1 шт.)",     "callback_data": f"bought:{sess_id}"},
+        {"text": "🛒 Купил несколько",   "callback_data": f"bought_multi:{sess_id}"},
     ]]}
 
 
@@ -1170,8 +1235,13 @@ def check_alert(item_id: str, lot: dict, qlt: int, ptn, is_art: bool = True):
     # AI прогноз (всегда пытаемся — покажем статус обучения если ещё не готов)
     ai = _ai_predict(item_id, qlt, pg) if is_art else None
 
-    msg    = _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art, analysis, ai)
-    markup = _bought_markup(item_id, lk)
+    # Глубина рынка и ближайшие лоты
+    depth   = _compute_market_depth(item_id, qlt, pg, unit) if is_art else {}
+    nearby  = depth.get("nearby_lots", [])
+    sess_id = _new_alert_session(item_id, lk, unit, nearby)
+
+    msg    = _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art, analysis, ai, depth)
+    markup = _bought_markup(sess_id)
 
     # Владелец и VIP — сразу
     tg_send(msg, TELEGRAM_CHAT_ID, markup)
@@ -1259,6 +1329,22 @@ _tg_offset  = 0
 _user_state : dict = {}
 # Сессии многоступенчатых покупок: chat_id -> {item_id, lk, entries: [], msg_id}
 _inv_pending: dict = {}
+# Кэш сессий алертов: sess_id -> {item_id, lk, buy_price, nearby_lots}
+_alert_cache: dict = {}
+_alert_cache_ctr: list = [0]   # mutable int для инкремента
+
+def _new_alert_session(item_id: str, lk: str, buy_price: float, nearby_lots: list) -> int:
+    _alert_cache_ctr[0] += 1
+    sid = _alert_cache_ctr[0]
+    _alert_cache[sid] = {"item_id": item_id, "lk": lk,
+                         "buy_price": buy_price, "nearby_lots": nearby_lots}
+    # Ограничиваем размер кэша
+    if len(_alert_cache) > 500:
+        oldest = sorted(_alert_cache)[:100]
+        for k in oldest:
+            _alert_cache.pop(k, None)
+    return sid
+
 # Кулдаун алертов о конкурентах: chat_id -> {item_id -> timestamp последнего алерта}
 _comp_alerted: dict = {}
 COMP_ALERT_COOLDOWN = 900  # 15 минут
@@ -1930,6 +2016,36 @@ def _handle_text(chat_id, text):
                 kb([("➕ Ещё","inv_add_more"),("✅ Готово","inv_done"),("❌ Отмена","inv_cancel")]))
         return
 
+    # ── Множественная покупка (новый флоу): ожидаем цену продажи ──
+    elif state.startswith("inv_multi_sp_new:"):
+        price = _parse_price(text)
+        if price is None or price <= 0:
+            _set(chat_id, state)
+            tg_send("❌ Неверный формат. Введи число:", chat_id,
+                    kb([("❌ Отмена", "main")])); return
+        session = _inv_pending.pop(chat_id, None)
+        if not session:
+            tg_send("❌ Сессия устарела.", chat_id, kb([("⬅️", "main")])); return
+        b_item    = session["item_id"]
+        b_lk      = session["lk"]
+        lots      = session["lots_to_buy"]
+        total_amt = session["total_amt"]
+        avg_buy   = session["avg_buy"]
+        iname     = item_name(b_item)
+        for lot in lots:
+            db.inv_add(chat_id, b_item, iname, lot["price"], price, lot["amount"])
+        db.exclude_lot(b_lk)
+        profit_est = (price * 0.968 - avg_buy) * total_amt
+        sign = "+" if profit_est >= 0 else ""
+        tg_send(
+            f"✅ Добавлено в инвентарь!\n"
+            f"📦 <b>{iname}</b>\n"
+            f"   {total_amt} шт. | ср. покупка {_fmt(avg_buy)} → продажа {_fmt(price)} руб.\n"
+            f"   Ожидаемая прибыль: <b>{sign}{_fmt(profit_est)}</b> руб.",
+            chat_id,
+            kb([("🛒 Мои товары", "my_items"), ("⬅️ Главное меню", "main")]))
+        return
+
     elif state == "search_art":
         _handle_search_art(chat_id, text)
     elif state == "search_item":
@@ -1995,32 +2111,102 @@ def _handle_callback(chat_id, msg_id, data):
             db.inv_del(chat_id, inv_key)
         _send_my_items(chat_id, msg_id)
     elif data.startswith("bought:"):
-        # Кнопка "Купил (1 шт.)" из алерта — запрашиваем цену покупки
-        parts = data.split(":", 2)
-        if len(parts) == 3:
-            _, b_item, b_lk = parts
+        # Кнопка "Купил (1 шт.)" — цена покупки берётся из алерта
+        parts = data.split(":")
+        if len(parts) == 2:
+            try: sess_id = int(parts[1])
+            except ValueError: return
+            sess = _alert_cache.get(sess_id)
+            if not sess:
+                tg_answer_text(msg_id, "Сессия устарела."); return
             if not _is_vip_or_owner(chat_id):
                 tg_answer_text(msg_id, "Только VIP/владелец может добавлять в инвентарь.")
                 return
-            _set(chat_id, f"inv_bp:{b_item}:{b_lk}")
+            b_item = sess["item_id"]
+            b_lk   = sess["lk"]
+            bp     = sess["buy_price"]
+            _set(chat_id, f"inv_sp:{b_item}:{b_lk}:1:{int(bp)}")
+            hint = _sell_price_hint(b_item, b_lk)
             tg_edit(chat_id, msg_id,
-                    f"🛒 <b>Купил (1 шт.)</b>\n\nВведи <b>цену покупки</b> (руб./шт.):",
+                    f"🛒 <b>Купил (1 шт.)</b>\n"
+                    f"💰 Цена покупки: <b>{_fmt(bp)}</b> руб.\n\n"
+                    f"Введи <b>цену продажи</b> (руб./шт.):{hint}",
                     kb([("❌ Отмена", "main")]))
     elif data.startswith("bought_multi:"):
-        # Кнопка "Купил несколько" из алерта
-        parts = data.split(":", 2)
-        if len(parts) == 3:
-            _, b_item, b_lk = parts
+        # Кнопка "Купил несколько" — показываем кнопки ближайших лотов
+        parts = data.split(":")
+        if len(parts) == 2:
+            try: sess_id = int(parts[1])
+            except ValueError: return
+            sess = _alert_cache.get(sess_id)
+            if not sess:
+                tg_answer_text(msg_id, "Сессия устарела."); return
             if not _is_vip_or_owner(chat_id):
                 tg_answer_text(msg_id, "Только VIP/владелец может добавлять в инвентарь.")
                 return
-            _inv_pending[chat_id] = {"item_id": b_item, "lk": b_lk, "entries": [], "msg_id": msg_id}
-            _set(chat_id, f"inv_multi_bp:{b_item}:{b_lk}")
+            nearby  = sess["nearby_lots"]
+            alert_p = sess["buy_price"]
+            b_item  = sess["item_id"]
+            b_lk    = sess["lk"]
+            if not nearby:
+                # Нет лотов выше — сразу спрашиваем цену продажи
+                _set(chat_id, f"inv_sp:{b_item}:{b_lk}:1:{int(alert_p)}")
+                hint = _sell_price_hint(b_item, b_lk)
+                tg_edit(chat_id, msg_id,
+                        f"🛒 <b>Купил несколько</b>\n"
+                        f"💰 Цена: <b>{_fmt(alert_p)}</b> руб. (нет лотов выше)\n\n"
+                        f"Введи <b>цену продажи</b> (руб./шт.):{hint}",
+                        kb([("❌ Отмена", "main")]))
+                return
+            # Строим кнопки: каждая покупает всё ≤ этой цене (алерт + лоты 0..i)
+            btns = []
+            cum_amt = 1  # 1 шт. — сам алерт
+            for i, lot in enumerate(nearby):
+                cum_amt += lot["amount"]
+                btns.append({
+                    "text": f"До {_fmt(lot['price'])} руб. ({cum_amt} шт.)",
+                    "callback_data": f"inv_multi_sel:{sess_id}:{i}",
+                })
+            kbd_rows = [btns[j:j+2] for j in range(0, len(btns), 2)]
+            kbd_rows.append([{"text": "❌ Отмена", "callback_data": "main"}])
             tg_edit(chat_id, msg_id,
-                    f"🛒 <b>Купил несколько</b>\n\n"
-                    f"Введи <b>цену покупки</b> и кол-во через пробел\n"
-                    f"<i>Пример: 150000 3  или просто 150000</i>",
-                    kb([("✅ Готово", "inv_done"), ("❌ Отмена", "inv_cancel")]))
+                    f"🛒 <b>Купил несколько</b>\n"
+                    f"💰 Алерт: <b>{_fmt(alert_p)}</b> руб.\n\n"
+                    f"Выбери до какой цены ты купил:",
+                    {"inline_keyboard": kbd_rows})
+    elif data.startswith("inv_multi_sel:"):
+        # Пользователь выбрал предел цены — считаем лоты, спрашиваем цену продажи
+        parts = data.split(":")
+        if len(parts) == 3:
+            try:
+                sess_id = int(parts[1])
+                idx     = int(parts[2])
+            except ValueError: return
+            sess = _alert_cache.get(sess_id)
+            if not sess or not _is_vip_or_owner(chat_id):
+                tg_answer_text(msg_id, "Ошибка сессии."); return
+            nearby  = sess["nearby_lots"]
+            alert_p = sess["buy_price"]
+            b_item  = sess["item_id"]
+            b_lk    = sess["lk"]
+            lots_to_buy = [{"price": alert_p, "amount": 1}] + \
+                          [{"price": l["price"], "amount": l["amount"]}
+                           for l in nearby[:idx + 1]]
+            total_amt  = sum(l["amount"] for l in lots_to_buy)
+            total_cost = sum(l["price"] * l["amount"] for l in lots_to_buy)
+            avg_buy    = total_cost / total_amt if total_amt else alert_p
+            _inv_pending[chat_id] = {
+                "item_id": b_item, "lk": b_lk,
+                "lots_to_buy": lots_to_buy,
+                "total_amt": total_amt, "avg_buy": avg_buy,
+            }
+            _set(chat_id, f"inv_multi_sp_new:{sess_id}")
+            hint = _sell_price_hint(b_item, b_lk)
+            tg_edit(chat_id, msg_id,
+                    f"🛒 <b>Покупка: {total_amt} шт.</b>\n"
+                    f"💰 Средняя цена: <b>{_fmt(avg_buy)}</b> руб./шт.\n\n"
+                    f"Введи <b>цену продажи</b> (руб./шт.):{hint}",
+                    kb([("❌ Отмена", "inv_cancel")]))
     elif data == "inv_done":
         # Завершить сессию многоступенчатой покупки
         _set(chat_id, "")
