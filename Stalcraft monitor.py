@@ -514,6 +514,285 @@ def _ema(prices: list, alpha=0.3):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  AI PRICE PREDICTOR
+# ═══════════════════════════════════════════════════════════════
+
+_PRED_FILE   = "ai_predictors.json"
+_PREDICTORS  : dict = {}   # pred_key -> PricePredictor
+
+
+class PricePredictor:
+    """
+    Онлайн-нейросеть для предсказания движения цен.
+
+    Архитектура : Input(8) → Dense(12, tanh) → Dense(1, linear)
+    Обучение    : SGD с адаптивным learning rate
+    Награда     : верное направление  → LR × 1.0  (стандартно)
+    Штраф       : неверное направление → LR × 2.0  (жёстче)
+    Показ прогноза: только когда total ≥ MIN_TRAIN И accuracy ≥ 60%
+    """
+    N_FEAT    = 8
+    N_HIDDEN  = 12
+    LR        = 0.008
+    PUNISH    = 2.0    # множитель LR при ошибке
+    MIN_TRAIN = 15     # минимум обновлений до первого показа
+    MIN_ACC   = 0.60   # порог точности направления
+
+    def __init__(self, key: str):
+        self.key     = key
+        self.total   = 0
+        self.correct = 0
+        self._w1 = None   # ndarray (N_FEAT × N_HIDDEN)
+        self._b1 = None   # ndarray (N_HIDDEN,)
+        self._w2 = None   # ndarray (N_HIDDEN,)
+        self._b2 = 0.0
+
+    # ── Статус ────────────────────────────────────────────────
+
+    @property
+    def accuracy(self) -> float:
+        return self.correct / self.total if self.total > 0 else 0.0
+
+    @property
+    def ready(self) -> bool:
+        return self.total >= self.MIN_TRAIN and self.accuracy >= self.MIN_ACC
+
+    # ── Инициализация весов ────────────────────────────────────
+
+    def _init_weights(self, np_):
+        rng = np_.random.default_rng(0)
+        self._w1 = rng.standard_normal((self.N_FEAT, self.N_HIDDEN)) * 0.1
+        self._b1 = np_.zeros(self.N_HIDDEN)
+        self._w2 = rng.standard_normal(self.N_HIDDEN) * 0.1
+        self._b2 = 0.0
+
+    # ── Признаки ──────────────────────────────────────────────
+
+    @staticmethod
+    def _features(prices: list, np_):
+        """
+        8 признаков из истории цен:
+          0 — последняя нормализованная цена
+          1 — среднее за последние 3 сделки
+          2 — среднее за последние 7 сделок
+          3 — моментум (last − mean)
+          4 — линейный наклон тренда
+          5 — волатильность (std/mean)
+          6 — RSI (avg_gain / (avg_gain + avg_loss))
+          7 — отклонение от медианы
+        Возвращает (feat, mean, std) или (None, 0, 1).
+        """
+        if len(prices) < 6:
+            return None, 0.0, 1.0
+        p  = np_.array(prices[-15:], dtype=float)
+        mn = float(np_.mean(p))
+        sd = max(float(np_.std(p)), mn * 0.001, 1.0)
+        pn = (p - mn) / sd
+
+        slope = 0.0
+        if len(p) >= 3:
+            xs    = np_.arange(len(p), dtype=float)
+            slope = float(np_.polyfit(xs, pn, 1)[0])
+
+        diffs  = np_.diff(p)
+        gains  = diffs[diffs > 0]
+        losses = -diffs[diffs < 0]
+        ag  = float(np_.mean(gains))  if len(gains)  > 0 else 0.0
+        al  = float(np_.mean(losses)) if len(losses) > 0 else 1e-8
+        rsi = ag / (ag + al)
+
+        feat = np_.array([
+            float(pn[-1]),
+            float(np_.mean(pn[-3:])),
+            float(np_.mean(pn[-7:])) if len(pn) >= 7 else float(np_.mean(pn)),
+            float(pn[-1] - np_.mean(pn)),
+            slope,
+            sd / (mn + 1e-8),
+            float(rsi),
+            float((p[-1] - float(np_.median(p))) / sd),
+        ], dtype=float)
+        return feat, mn, sd
+
+    # ── Forward pass ──────────────────────────────────────────
+
+    def _forward(self, feat, np_):
+        h = np_.tanh(feat @ self._w1 + self._b1)
+        return float(h @ self._w2 + self._b2), h
+
+    # ── Предсказание ──────────────────────────────────────────
+
+    def predict(self, prices: list) -> Optional[dict]:
+        try:
+            import numpy as np_
+        except ImportError:
+            return None
+        if self._w1 is None:
+            self._init_weights(np_)
+        feat, mn, sd = self._features(prices, np_)
+        if feat is None:
+            return None
+        pred_norm, _ = self._forward(feat, np_)
+        pred_price   = max(int(mn + pred_norm * sd), 1)
+
+        if pred_norm > 0.05:    direction = "up"
+        elif pred_norm < -0.05: direction = "down"
+        else:                   direction = "flat"
+
+        return {
+            "price":     pred_price,
+            "direction": direction,
+            "delta_pct": round(pred_norm * 100, 1),
+            "ready":     self.ready,
+            "accuracy":  round(self.accuracy * 100, 1),
+            "trained":   self.total,
+        }
+
+    # ── Обучение (SGD + reward/punishment) ────────────────────
+
+    def update(self, prices_before: list, actual_price: float):
+        """
+        Один шаг обучения на реальной продаже.
+        Награда:  верное направление  → LR × 1.0
+        Штраф:    неверное            → LR × PUNISH (×2)
+        """
+        try:
+            import numpy as np_
+        except ImportError:
+            return
+        if self._w1 is None:
+            self._init_weights(np_)
+
+        feat, mn, sd = self._features(prices_before, np_)
+        if feat is None:
+            return
+
+        actual_norm       = (actual_price - mn) / sd
+        pred_norm, h      = self._forward(feat, np_)
+
+        pred_dir   = "up" if pred_norm   > 0.05 else ("down" if pred_norm   < -0.05 else "flat")
+        actual_dir = "up" if actual_norm > 0.05 else ("down" if actual_norm < -0.05 else "flat")
+        is_correct = (pred_dir == actual_dir)
+
+        # Адаптивный LR: штраф × PUNISH при ошибке
+        lr_eff = self.LR * (1.0 if is_correct else self.PUNISH)
+        error  = float(actual_norm - pred_norm)
+
+        # Backprop (одно скрытое слой)
+        d_w2 = lr_eff * error * h
+        d_b2 = lr_eff * error
+        d_h  = lr_eff * error * self._w2
+        d_z1 = d_h * (1.0 - h ** 2)          # производная tanh
+        d_w1 = np_.outer(feat, d_z1)
+        d_b1 = d_z1
+
+        self._w2 += d_w2
+        self._b2 += d_b2
+        self._w1 += d_w1
+        self._b1 += d_b1
+
+        self.total   += 1
+        self.correct += int(is_correct)
+        log.debug(
+            f"AI[{self.key}] #{self.total}: "
+            f"pred={pred_dir} real={actual_dir} "
+            f"{'✓' if is_correct else '✗'} acc={self.accuracy:.0%}"
+        )
+
+    # ── Сериализация ──────────────────────────────────────────
+
+    def to_dict(self) -> dict:
+        return {
+            "total":   self.total,
+            "correct": self.correct,
+            "b2":      self._b2,
+            "w1":      self._w1.tolist() if self._w1 is not None else None,
+            "b1":      self._b1.tolist() if self._b1 is not None else None,
+            "w2":      self._w2.tolist() if self._w2 is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, key: str, d: dict) -> "PricePredictor":
+        obj = cls(key)
+        obj.total   = d.get("total", 0)
+        obj.correct = d.get("correct", 0)
+        obj._b2     = float(d.get("b2", 0.0))
+        try:
+            import numpy as np_
+            if d.get("w1") is not None: obj._w1 = np_.array(d["w1"], dtype=float)
+            if d.get("b1") is not None: obj._b1 = np_.array(d["b1"], dtype=float)
+            if d.get("w2") is not None: obj._w2 = np_.array(d["w2"], dtype=float)
+        except Exception:
+            pass
+        return obj
+
+
+# ── Реестр предсказателей ─────────────────────────────────────
+
+def _pred_key(item_id: str, qlt: int, pg: str) -> str:
+    return f"{item_id}:{qlt}:{pg}"
+
+def _get_predictor(item_id: str, qlt: int, pg: str) -> PricePredictor:
+    key = _pred_key(item_id, qlt, pg)
+    if key not in _PREDICTORS:
+        _PREDICTORS[key] = PricePredictor(key)
+    return _PREDICTORS[key]
+
+def _ai_predict(item_id: str, qlt: int, pg: str) -> Optional[dict]:
+    """
+    Прогноз для предмета/качества/заточки.
+    Возвращает dict (ready=True/False) или None если истории нет.
+    """
+    with db._lock:
+        prices = [
+            s["unit_price"] for s in db.sales
+            if s["item_id"] == item_id
+            and s.get("qlt", 0) == qlt
+            and s.get("ptn_grp", ptn_group(s.get("ptn"))) == pg
+            and not db.is_excluded(s)
+        ][-30:]
+    if len(prices) < 6:
+        return None
+    return _get_predictor(item_id, qlt, pg).predict(prices)
+
+def _ai_train(item_id: str, sale: dict):
+    """Один шаг обучения на реальной продаже."""
+    qlt     = sale.get("qlt", 0)
+    pg      = sale.get("ptn_grp", ptn_group(sale.get("ptn")))
+    sale_ts = sale.get("sold_at", "9999")
+    with db._lock:
+        prev = [
+            s["unit_price"] for s in db.sales
+            if s["item_id"] == item_id
+            and s.get("qlt", 0) == qlt
+            and s.get("ptn_grp", ptn_group(s.get("ptn"))) == pg
+            and s.get("sold_at", "") < sale_ts
+        ][-20:]
+    if len(prev) < 6:
+        return
+    _get_predictor(item_id, qlt, pg).update(prev, sale["unit_price"])
+
+def _save_predictors():
+    try:
+        data = {k: v.to_dict() for k, v in _PREDICTORS.items()}
+        Path(_PRED_FILE).write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+    except Exception as e:
+        log.error(f"Сохранение AI: {e}")
+
+def _load_predictors():
+    p = Path(_PRED_FILE)
+    if not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text("utf-8"))
+        for key, d in data.items():
+            _PREDICTORS[key] = PricePredictor.from_dict(key, d)
+        ready = sum(1 for v in _PREDICTORS.values() if v.ready)
+        log.info(f"AI: загружено {len(_PREDICTORS)} моделей, {ready} готовы к прогнозу")
+    except Exception as e:
+        log.error(f"Загрузка AI: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
 #  MARKET ANALYSIS
 # ═══════════════════════════════════════════════════════════════
 
@@ -524,11 +803,9 @@ def _market_analysis(prices_with_times: list) -> dict:
     Возвращает dict с сигналами.
     """
     result = {
-        "panic_sale":  None,  # str описание или None
-        "reversal":    None,
-        "bot_pattern": None,
-        "forecast":    None,
-        "trend":       None,  # "up"/"down"/"flat"
+        "panic_sale": None,   # str описание или None
+        "reversal":   None,
+        "trend":      None,   # "up"/"down"/"flat"
     }
     if len(prices_with_times) < 4:
         return result
@@ -577,47 +854,6 @@ def _market_analysis(prices_with_times: list) -> dict:
                 result["trend"] = "flat"
             else:
                 result["trend"] = "down"
-
-    # ── 🤖 ДЕТЕКТ БОТОВ/МАНИПУЛЯЦИЙ ──────────────────────────
-    # Признаки: много одинаковых цен, или продажи через ровные промежутки
-    if n >= 5:
-        rounded = sum(1 for p in prices if p % 1000 == 0 or p % 500 == 0)
-        if rounded / n > 0.7:
-            result["bot_pattern"] = f"🤖 Возможна манипуляция: {rounded}/{n} продаж по круглым ценам"
-
-        # Дублирующиеся цены
-        from collections import Counter
-        price_counts = Counter(int(p) for p in prices)
-        max_dup = price_counts.most_common(1)[0][1] if price_counts else 0
-        if max_dup >= 3:
-            result["bot_pattern"] = (
-                f"🤖 Ботовая активность: одна цена повторяется {max_dup}x"
-            )
-
-    # ── 💰 ПРОГНОЗ ЦЕНЫ (линейный тренд по времени) ──────────
-    if n >= 5:
-        try:
-            t0 = times[0]
-            xs = [(t - t0) / 3600 for t in times]  # в часах
-            # Метод наименьших квадратов вручную
-            n_pts = len(xs)
-            sx  = sum(xs);    sy  = sum(prices)
-            sxy = sum(x*y for x,y in zip(xs, prices))
-            sx2 = sum(x**2 for x in xs)
-            denom = n_pts * sx2 - sx * sx
-            if abs(denom) > 1e-9:
-                slope = (n_pts * sxy - sx * sy) / denom
-                # Прогноз на +24 часа
-                x_future = xs[-1] + 24
-                forecast = (sy/n_pts) + slope * (x_future - sx/n_pts)
-                forecast = max(forecast, 0)
-                direction = "▲" if slope > 0 else "▼"
-                if abs(slope) / (avg_p / 100) > 0.5:  # значимый тренд
-                    result["forecast"] = (
-                        f"💰 Прогноз +24ч: {direction} {int(forecast):,}".replace(",", " ") + " руб."
-                    )
-        except Exception:
-            pass
 
     return result
 
@@ -828,7 +1064,7 @@ def _fmt(v) -> str:
     return str(v)
 
 def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
-                 analysis: dict = None) -> str:
+                 analysis: dict = None, ai: dict = None) -> str:
     circle = QUALITY_CIRCLE.get(qlt, "")
     qname  = QUALITY.get(qlt, ("?",""))[0]
     name   = art_name(item_id) if is_art else item_name(item_id)
@@ -856,10 +1092,8 @@ def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
     # Рыночные сигналы
     if analysis:
         signals = []
-        if analysis.get("panic_sale"):  signals.append(analysis["panic_sale"])
-        if analysis.get("reversal"):    signals.append(analysis["reversal"])
-        if analysis.get("bot_pattern"): signals.append(analysis["bot_pattern"])
-        if analysis.get("forecast"):    signals.append(analysis["forecast"])
+        if analysis.get("panic_sale"): signals.append(analysis["panic_sale"])
+        if analysis.get("reversal"):   signals.append(analysis["reversal"])
         if analysis.get("trend") == "up":
             signals.append("📈 Тренд: цена растёт")
         elif analysis.get("trend") == "down":
@@ -867,6 +1101,21 @@ def _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art,
         if signals:
             lines.append("")
             lines.extend(signals)
+
+    # AI прогноз
+    if ai:
+        lines.append("")
+        if ai.get("ready"):
+            d_icon = {"up": "▲", "down": "▼", "flat": "→"}.get(ai["direction"], "→")
+            lines.append(
+                f"🤖 AI прогноз: <b>{d_icon} {_fmt(ai['price'])}</b> руб. "
+                f"(точность <b>{ai['accuracy']}%</b>, {ai['trained']} сделок)"
+            )
+        else:
+            lines.append(
+                f"🤖 AI обучается… {ai['trained']}/{PricePredictor.MIN_TRAIN} сделок, "
+                f"точность {ai['accuracy']}%"
+            )
 
     lines += [
         "",
@@ -918,7 +1167,10 @@ def check_alert(item_id: str, lot: dict, qlt: int, ptn, is_art: bool = True):
         history = _get_price_history_timed(item_id, qlt, pg)
         analysis = _market_analysis(history) if len(history) >= 4 else None
 
-    msg    = _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art, analysis)
+    # AI прогноз (всегда пытаемся — покажем статус обучения если ещё не готов)
+    ai = _ai_predict(item_id, qlt, pg) if is_art else None
+
+    msg    = _build_alert(item_id, lot, qlt, ptn, pg, unit, avg, disc, n, is_art, analysis, ai)
     markup = _bought_markup(item_id, lk)
 
     # Владелец и VIP — сразу
@@ -2277,9 +2529,12 @@ def process_item(item_id: str, is_art: bool):
         if _cycle_buyouts >= MAX_BUYOUTS_PER_CYCLE:
             log.warning(f"Предохранитель: {_cycle_buyouts} выкупов за цикл — подозрительно, "
                         f"остановка detect_buyouts до следующего цикла")
-        # Проверяем продажи инвентаря пользователей
+        # Проверяем продажи инвентаря пользователей + обучаем AI
         if bought:
             check_inventory_sales(item_id, bought)
+            if is_art:
+                for sale in bought:
+                    _ai_train(item_id, sale)
 
     # Проверяем конкурентов для инвентаря (после обновления active_lots)
     check_competitor_undercut(item_id)
@@ -2320,6 +2575,7 @@ def monitor_loop():
 
         if cycle % 5 == 0:
             db.save()
+            _save_predictors()
         log.info(f"Цикл #{cycle} готов. Следующий через {POLL_INTERVAL} сек.")
         time.sleep(POLL_INTERVAL)
 
@@ -2467,6 +2723,7 @@ if __name__ == "__main__":
         log.error("База пуста — запусти: python stalcraft_monitor.py --update")
         sys.exit(1)
 
+    _load_predictors()
     log.info(f"Артефактов: {len(art_db)} | Предметов: {len(item_db)}")
     threading.Thread(target=start_web,            daemon=True).start()
     threading.Thread(target=tg_polling_loop,      daemon=True).start()
