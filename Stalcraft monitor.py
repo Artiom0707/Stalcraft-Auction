@@ -1294,10 +1294,19 @@ def tg_send(text, chat_id, markup=None):
     if markup: kw["reply_markup"] = markup
     return _tg("sendMessage", **kw)
 
+def tg_force_reply(chat_id, text: str):
+    """Отправляет сообщение с ForceReply — Telegram сразу открывает поле ввода ответа."""
+    return tg_send(text, chat_id, {"force_reply": True, "selective": True})
+
 def tg_edit(chat_id, msg_id, text, markup=None):
     kw = {"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML"}
     if markup: kw["reply_markup"] = markup
     return _tg("editMessageText", **kw)
+
+def tg_remove_markup(chat_id, msg_id):
+    """Убирает инлайн-кнопки с сообщения (оставляет текст)."""
+    _tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
+        reply_markup={"inline_keyboard": []})
 
 def tg_answer(cid):
     _tg("answerCallbackQuery", callback_id=cid)
@@ -1943,9 +1952,13 @@ def _handle_text(chat_id, text):
 
     # ── Одиночная покупка: ожидаем цену продажи ───────────────
     elif state.startswith("inv_sp:"):
-        parts = state.split(":")
-        if len(parts) == 5:
-            _, b_item, b_lk, amt_s, bp_s = parts
+        # Формат: inv_sp:{b_item}:{b_lk}:{amt}:{bp}
+        # b_lk может содержать двоеточия (ISO-дата) — rsplit от конца
+        rparts = state.rsplit(":", 2)           # ["inv_sp:{item}:{lk}", amt, bp]
+        p2     = rparts[0].split(":", 2) if len(rparts) == 3 else []
+        if len(rparts) == 3 and len(p2) == 3:
+            _, b_item, b_lk = p2
+            amt_s, bp_s     = rparts[1], rparts[2]
             price = _parse_price(text)
             if price is None or price <= 0:
                 _set(chat_id, state)
@@ -1991,9 +2004,12 @@ def _handle_text(chat_id, text):
 
     # ── Множественная покупка: ожидаем цену продажи ───────────
     elif state.startswith("inv_multi_sp:"):
-        parts = state.split(":")
-        if len(parts) == 5:
-            _, b_item, b_lk, amt_s, bp_s = parts
+        # Формат: inv_multi_sp:{b_item}:{b_lk}:{amt}:{bp}  — rsplit чтобы не ломаться на двоеточиях в lk
+        rparts = state.rsplit(":", 2)
+        p2     = rparts[0].split(":", 2) if len(rparts) == 3 else []
+        if len(rparts) == 3 and len(p2) == 3:
+            _, b_item, b_lk = p2
+            amt_s, bp_s     = rparts[1], rparts[2]
             price = _parse_price(text)
             if price is None or price <= 0:
                 _set(chat_id, state)
@@ -2127,11 +2143,11 @@ def _handle_callback(chat_id, msg_id, data):
             bp     = sess["buy_price"]
             _set(chat_id, f"inv_sp:{b_item}:{b_lk}:1:{int(bp)}")
             hint = _sell_price_hint(b_item, b_lk)
-            tg_edit(chat_id, msg_id,
+            tg_remove_markup(chat_id, msg_id)
+            tg_force_reply(chat_id,
                     f"🛒 <b>Купил (1 шт.)</b>\n"
                     f"💰 Цена покупки: <b>{_fmt(bp)}</b> руб.\n\n"
-                    f"Введи <b>цену продажи</b> (руб./шт.):{hint}",
-                    kb([("❌ Отмена", "main")]))
+                    f"Введи <b>цену продажи</b> (руб./шт.):{hint}")
     elif data.startswith("bought_multi:"):
         # Кнопка "Купил несколько" — показываем кнопки ближайших лотов
         parts = data.split(":")
@@ -2152,11 +2168,11 @@ def _handle_callback(chat_id, msg_id, data):
                 # Нет лотов выше — сразу спрашиваем цену продажи
                 _set(chat_id, f"inv_sp:{b_item}:{b_lk}:1:{int(alert_p)}")
                 hint = _sell_price_hint(b_item, b_lk)
-                tg_edit(chat_id, msg_id,
+                tg_remove_markup(chat_id, msg_id)
+                tg_force_reply(chat_id,
                         f"🛒 <b>Купил несколько</b>\n"
                         f"💰 Цена: <b>{_fmt(alert_p)}</b> руб. (нет лотов выше)\n\n"
-                        f"Введи <b>цену продажи</b> (руб./шт.):{hint}",
-                        kb([("❌ Отмена", "main")]))
+                        f"Введи <b>цену продажи</b> (руб./шт.):{hint}")
                 return
             # Строим кнопки: каждая покупает всё ≤ этой цене (алерт + лоты 0..i)
             btns = []
@@ -2202,11 +2218,11 @@ def _handle_callback(chat_id, msg_id, data):
             }
             _set(chat_id, f"inv_multi_sp_new:{sess_id}")
             hint = _sell_price_hint(b_item, b_lk)
-            tg_edit(chat_id, msg_id,
+            tg_remove_markup(chat_id, msg_id)
+            tg_force_reply(chat_id,
                     f"🛒 <b>Покупка: {total_amt} шт.</b>\n"
                     f"💰 Средняя цена: <b>{_fmt(avg_buy)}</b> руб./шт.\n\n"
-                    f"Введи <b>цену продажи</b> (руб./шт.):{hint}",
-                    kb([("❌ Отмена", "inv_cancel")]))
+                    f"Введи <b>цену продажи</b> (руб./шт.):{hint}")
     elif data == "inv_done":
         # Завершить сессию многоступенчатой покупки
         _set(chat_id, "")
